@@ -30,7 +30,7 @@ def load() -> dict:
         return _CACHE["data"]
     data = {k: dict(v) for k, v in DEFAULTS.items()}
     if PROFILE_FILE.exists():
-        for k, v in json.loads(PROFILE_FILE.read_text()).items():
+        for k, v in json.loads(PROFILE_FILE.read_text(encoding="utf-8")).items():
             data.setdefault(k, {}).update(v)
     for v in data.values():  # a missing image file falls back to a neutral emoji
         a = v.get("avatar", "")
@@ -42,7 +42,7 @@ def load() -> dict:
 
 def save(agent: str, name: str | None = None, avatar: str | None = None, image_bytes: bytes | None = None,
          ext: str = "png") -> None:
-    current = json.loads(PROFILE_FILE.read_text()) if PROFILE_FILE.exists() else {}
+    current = json.loads(PROFILE_FILE.read_text(encoding="utf-8")) if PROFILE_FILE.exists() else {}
     entry = current.setdefault(agent, {})
     if name:
         entry["name"] = name
@@ -53,18 +53,18 @@ def save(agent: str, name: str | None = None, avatar: str | None = None, image_b
         entry["avatar"] = f"assets/avatars/{path.name}"
     elif avatar:
         entry["avatar"] = avatar
-    PROFILE_FILE.write_text(json.dumps(current, indent=1))
+    PROFILE_FILE.write_text(json.dumps(current, indent=1), encoding="utf-8")
 
 
 def reset(agent: str | None = None) -> None:
     if not PROFILE_FILE.exists():
         return
-    current = json.loads(PROFILE_FILE.read_text())
+    current = json.loads(PROFILE_FILE.read_text(encoding="utf-8"))
     if agent is None:
         current = {}
     else:
         current.pop(agent, None)
-    PROFILE_FILE.write_text(json.dumps(current, indent=1))
+    PROFILE_FILE.write_text(json.dumps(current, indent=1), encoding="utf-8")
 
 
 def avatar_for_streamlit(agent: str, profiles: dict | None = None):

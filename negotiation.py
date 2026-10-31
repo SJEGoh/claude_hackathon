@@ -98,7 +98,7 @@ class ConsensusLog:
 
     def save(self, path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(e.model_dump_json() for e in self.entries) + "\n")
+        path.write_text("\n".join(e.model_dump_json() for e in self.entries) + "\n", encoding="utf-8")
         return path
 
 

@@ -209,8 +209,8 @@ def main() -> None:
            "(section 2 percentiles).\n"]
 
     OUT.mkdir(exist_ok=True)
-    (OUT / "EDA_REPORT.md").write_text("\n".join(md) + "\n")
-    (OUT / "calibration.json").write_text(json.dumps(cal, indent=1))
+    (OUT / "EDA_REPORT.md").write_text("\n".join(md) + "\n", encoding="utf-8")
+    (OUT / "calibration.json").write_text(json.dumps(cal, indent=1), encoding="utf-8")
     print("\n".join(md))
     print(f"\nWrote {OUT / 'EDA_REPORT.md'} and {OUT / 'calibration.json'}")
 

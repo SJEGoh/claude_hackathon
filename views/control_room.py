@@ -363,7 +363,7 @@ with tab_wx:
     def live_panel():
         st.markdown("---\n**Live feed (aviationweather.gov, refreshed by `weather_poller.py`)**")
         idx_path = ROOT / "weather_cache" / "live_index.json"
-        index = json.loads(idx_path.read_text()) if idx_path.exists() else {}
+        index = json.loads(idx_path.read_text(encoding="utf-8")) if idx_path.exists() else {}
         if st.button(f"Poll {s.destination} now"):
             import weather_poller
             index = weather_poller.poll([s.destination])

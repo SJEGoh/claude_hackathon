@@ -222,7 +222,7 @@ def load_disrupted_flights(limit: Optional[int] = 500) -> pd.DataFrame:
 
 @lru_cache(maxsize=1)
 def calibration() -> dict:
-    return json.loads(CALIBRATION.read_text()) if CALIBRATION.exists() else {}
+    return json.loads(CALIBRATION.read_text(encoding="utf-8")) if CALIBRATION.exists() else {}
 
 
 @lru_cache(maxsize=1)
