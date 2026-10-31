@@ -8,12 +8,17 @@ Protocol (max 3 turns). The Chief of Staff opens; then, per turn:
   3. Safety gate: an ACCEPT that breaks the agent's own hard limits is overridden.
   4. Consensus = both ACCEPT plan #n AND it passes every hard check in every domain.
   5. No consensus: the Chief of Staff briefs the next turn.
-After turn 3 the deterministic non-AI planner decides.
+After turn 3 of a round without consensus, the deterministic non-AI planner decides.
+
+Ratification. A consensus does not commit by itself. The Chief of Staff sends the three stakeholders a summary of
+the plan and everyone's reasoning; each agrees or disagrees with a reason. All agree: the plan is committed. Any
+disagreement: the Chief collates the objections and a second round of up to MAX_TURNS turns debates them (this goes
+beyond the workbook's 3-turn rule, and is stated in the README). If that plan is rejected too, the planner decides.
 
 The engine is a generator, so it can PAUSE for a human at decision points without losing any state:
-  AUTONOMOUS    never pauses; every decision takes its safe default (alarms still go out)
-  SUPERVISED    pauses on risk: agreed plan near a limit, deadlock, agent failure/timeout, fallback
-  STEP_BY_STEP  pauses after every turn and before committing anything
+  AUTONOMOUS    never pauses; every decision takes its safe default, and the AI agents vote (alarms still go out)
+  SUPERVISED    pauses for the stakeholders' votes and on risk: deadlock, agent failure/timeout, fallback
+  STEP_BY_STEP  also pauses after every turn
 Whatever a human picks, only plans that pass every hard check are ever offered.
 """
 from __future__ import annotations
@@ -29,7 +34,9 @@ from typing import Callable, Iterator, Literal, Optional
 
 from pydantic import BaseModel
 
-from agents import AgentError, AgentMessage, BaseAgent, ModeratorAgent, ModeratorMessage, render_brief, render_message
+from agents import (
+    AgentError, AgentMessage, BaseAgent, ModeratorAgent, ModeratorMessage, StakeholderVote, render_brief, render_message,
+)
 from constraints import (
     VALIDATORS, Domain, DomainReport, FallbackResult, Proposal, check_all, cost, cost_breakdown, deterministic_plan,
     is_safe,
@@ -38,7 +45,9 @@ from escalation import Alarm, dispatch
 from monitoring import CallMetric, summarise
 from scenario import LIMITS, MIN_FUEL_ADVISORY_MARGIN_MIN, Scenario
 
-MAX_TURNS = 3
+MAX_TURNS = 3  # per round of debate
+MAX_ROUNDS = 2  # the first debate, plus one more if the stakeholders reject its plan
+STAKEHOLDERS = ("ATC", "PILOT", "GROUND")
 LOG_DIR = Path(__file__).parent / "logs"
 
 
@@ -105,7 +114,7 @@ class DecisionOption(BaseModel):
 
 
 class DecisionRequest(BaseModel):
-    code: str  # CONSENSUS_REVIEW, TURN_REVIEW, DEADLOCK, AGENT_TIMEOUT, AGENT_FAILURE, FALLBACK_REVIEW
+    code: str  # TURN_REVIEW, DEADLOCK, AGENT_TIMEOUT, AGENT_FAILURE, FALLBACK_REVIEW
     severity: Literal["INFO", "WARNING", "ALARM"]
     title: str
     briefing: list[str]  # the "clear box": what happened and why this needs a human
@@ -127,6 +136,56 @@ class _Stop(Exception):
 
 
 # ============================================================================
+# Stakeholder ratification
+# ============================================================================
+
+class StakeholderPosition(BaseModel):
+    agent: Domain
+    stance: str
+    rationale: str
+    concession: str
+    constraints: list[str]
+
+
+class RatificationRequest(BaseModel):
+    """The Chief of Staff's brief. Figures in `facts` and `risks` come from code; only the chief_ fields are LLM text."""
+    round: int
+    turn: int
+    plan_id: int
+    proposal: Proposal
+    plan_text: str
+    facts: list[str]
+    risks: list[str]
+    positions: list[StakeholderPosition]
+    chief_summary: Optional[str] = None
+    chief_reasoning: Optional[str] = None
+
+
+class RatificationRecord(BaseModel):
+    round: int
+    turn: int
+    plan_id: int
+    proposal: Proposal
+    votes: list[StakeholderVote]
+    accepted: bool
+
+
+def render_positions(positions: list[StakeholderPosition]) -> str:
+    return "\n".join(f"- {p.agent} ({p.stance}): {p.rationale} Concession: {p.concession}"
+                     + (f" Published: {'; '.join(p.constraints)}." if p.constraints else "") for p in positions)
+
+
+def agent_briefing(req: RatificationRequest) -> str:
+    """What an AI stakeholder is told. Leaves out `facts` and `risks`, which hold other domains' private figures."""
+    lines = [f"Round {req.round}, plan #{req.plan_id}: {req.plan_text}."]
+    if req.chief_summary:
+        lines.append(f"Summary: {req.chief_summary}")
+    if req.chief_reasoning:
+        lines.append(f"Chief of Staff's reasoning: {req.chief_reasoning}")
+    return "\n".join([*lines, "Each stakeholder's position:", render_positions(req.positions)])
+
+
+# ============================================================================
 # Outcome
 # ============================================================================
 
@@ -134,6 +193,8 @@ class Outcome(BaseModel):
     status: Literal["CONSENSUS", "FALLBACK", "HUMAN_DECISION"]
     plan_source: str
     turns_used: int
+    rounds: int = 1
+    ratifications: list[RatificationRecord] = []
     proposal: Proposal
     reports: dict[str, DomainReport]
     cost: Optional[float]
@@ -163,7 +224,9 @@ def _key(p: Proposal) -> tuple:
 
 class NegotiationSession:
     """Drive with `advance()`: returns the next (kind, data) event. When kind == "decision", call
-    `advance(option_id)` with the human's choice. kind == "outcome" ends the session."""
+    `advance(option_id)` with the human's choice. When kind == "ratification", call
+    `advance({"ATC": {"agree": bool, "reason": str}, ...})` with the people's votes; the AI agent answers for anyone
+    left out. kind == "outcome" ends the session."""
 
     def __init__(self, s: Scenario, agents: dict[str, BaseAgent], autonomy: Autonomy = Autonomy.AUTONOMOUS,
                  save_log: bool = True, deadline_s: Optional[float] = None):
@@ -179,6 +242,15 @@ class NegotiationSession:
         self.public: list[tuple[int, str]] = []  # (turn, rendered line) for the compact bus view
         self.ledger: dict[tuple[str, str], str] = {}  # (agent, constraint) -> rendered, latest wins
         self.seen_plans: dict[tuple, Proposal] = {}
+        self.rejected: set[tuple] = set()  # plans the stakeholders voted down: never kept as "best so far"
+        self.ratifications: list[RatificationRecord] = []
+        self.objections = ""  # the latest rejection's concerns, for the Chief of Staff's next brief
+        self.round = 1
+        self.round_turn = 0
+        self.turn = 0  # counts across rounds, so the log and the bus stay in order
+        self.plan_id = 0
+        self.on_table: Optional[Proposal] = None
+        self.last_countered: Optional[tuple] = None
         self.deadlock = False
         self.safety_overrides = 0
         self.stale_replies = 0
@@ -199,7 +271,8 @@ class NegotiationSession:
     def _bus(self, turn: int) -> str:
         ledger = "\n".join(f"  {v}" for v in self.ledger.values()) or "  (none yet)"
         recent = "\n".join(line for t, line in self.public if t >= turn - 1)
-        return f"CONSTRAINT LEDGER (latest per specialist):\n{ledger}\nRECENT TRAFFIC:\n{recent or '  (none)'}"
+        status = f"ROUND {self.round} of {MAX_ROUNDS}, turn {max(self.round_turn, 1)} of {MAX_TURNS}.\n"
+        return f"{status}CONSTRAINT LEDGER (latest per specialist):\n{ledger}\nRECENT TRAFFIC:\n{recent or '  (none)'}"
 
     def _record(self, msg: AgentMessage):
         self.messages.append(msg)
@@ -233,7 +306,7 @@ class NegotiationSession:
         best = None
         for p in self.seen_plans.values():
             r = check_all(self.s, p)
-            if is_safe(r):
+            if is_safe(r) and _key(p) not in self.rejected:
                 c = cost(self.s, p, r)
                 if best is None or c < best[1]:
                     best = (p, c)
@@ -244,7 +317,9 @@ class NegotiationSession:
         rows = []
         for p in list(self.seen_plans.values())[-8:]:
             r = check_all(self.s, p)
-            if is_safe(r):
+            if _key(p) in self.rejected:
+                rows.append(f"- {self._describe(p)}: REJECTED BY THE STAKEHOLDERS")
+            elif is_safe(r):
                 items = sorted(cost_breakdown(self.s, p, r).items(), key=lambda kv: -kv[1])[:2]
                 rows.append(f"- {self._describe(p)}: SAFE, ${cost(self.s, p, r):,.0f} "
                             f"(largest: {', '.join(f'{k} ${v:,.0f}' for k, v in items if v)})")
@@ -346,7 +421,8 @@ class NegotiationSession:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             path = str(self.log.save(LOG_DIR / f"{s.flight}_{s.date}_{stamp}.jsonl"))
         self.outcome = Outcome(
-            status=status, plan_source=source, turns_used=turns, proposal=proposal, reports=reports, cost=final_cost,
+            status=status, plan_source=source, turns_used=turns, rounds=self.round, ratifications=self.ratifications,
+            proposal=proposal, reports=reports, cost=final_cost,
             reference=self.reference, reason=reason, messages=self.messages, briefs=self.briefs,
             decisions=self.decisions, alarms=self.alarms, metrics=self.metrics, usage=summarise(self.metrics),
             deadlock=self.deadlock, deadline_hit=self.deadline_hit, safety_overrides=self.safety_overrides, stale_replies=self.stale_replies,
@@ -400,137 +476,236 @@ class NegotiationSession:
             "weather_sources": [x.model_dump() for x in (s.weather.sources if s.weather else [])],
             "limits_source": {"workbook": LIMITS.source, "sha256": LIMITS.sha256,
                               "airport": s.airport_limits.model_dump()},
-            "autonomy": self.autonomy.value, "max_turns": MAX_TURNS,
+            "autonomy": self.autonomy.value, "max_turns": MAX_TURNS, "max_rounds": MAX_ROUNDS,
             "models": {k: a.model for k, a in self.agents.items()}})
-        turn = 0
         try:
             yield from self._moderate(0, opening=True)
-            on_table: Optional[Proposal] = None
-            plan_id = 0
-            last_countered: Optional[tuple] = None
-            for turn in range(1, MAX_TURNS + 1):
-                if self._over_budget():
-                    yield self._alarm("TIME_BUDGET", "ALARM", "Negotiation time budget exceeded",
-                                      f"{time.monotonic() - self.started:.1f}s > {self.deadline_s:.0f}s budget", turn)
-                    raise _Stop("keep_partial" if self.best_partial() else "fallback")
-                if turn > 1:
-                    yield from self._moderate(turn - 1, opening=False)
-                yield ("turn", {"turn": turn})
-
-                # 1. ATC tables a plan --------------------------------------------------
-                prev = VALIDATORS["ATC"](s, on_table) if on_table else None
-                got = yield from self._ask_agents(turn, {"ATC": lambda: self.agents["ATC"].act(
-                    s, turn, self._bus(turn), on_table, plan_id, prev)})
-                atc_msg: AgentMessage = got["ATC"]
-                plan_id += 1
-                atc_msg.stance, atc_msg.plan_id, atc_msg.answering_plan = "PROPOSE", plan_id, 0
-                yield self._record(atc_msg)
-                proposal = atc_msg.proposal
-
-                atc_report = VALIDATORS["ATC"](s, proposal)
-                if not atc_report.hard_ok:
-                    yield self._note(turn, "safety_block", f"Plan #{plan_id} blocked by the ATC validator: "
-                                     + "; ".join(c.detail for c in atc_report.violations()))
-                    continue
-                if last_countered == _key(proposal):
-                    self.deadlock = True
-                    yield self._alarm("DEADLOCK", "ALARM", "Negotiation deadlock",
-                                      f"ATC re-tabled plan {self._describe(proposal)} unchanged after it was countered.",
-                                      turn)
-                    opts = self._exit_options()
-                    if turn < MAX_TURNS:
-                        opts.insert(0, DecisionOption(id="one_more_turn", label="Allow one more turn",
-                                                      description="Let the specialists try once more."))
-                    req = DecisionRequest(code="DEADLOCK", severity="ALARM", turn=turn, title="Specialists are stuck",
-                                          briefing=[f"Plan #{plan_id} repeats a plan that was already countered.",
-                                                    "Continuing unchanged would burn turns without progress."],
-                                          options=opts, default="keep_partial" if self.best_partial() else "fallback")
-                    choice = yield from self._decide(req)
-                    if choice != "one_more_turn":
-                        raise _Stop(choice)
-                on_table = proposal
-
-                # 2-3. Flight Crew + AOCC answer in parallel ----------------------------
-                own = {d: VALIDATORS[d](s, proposal) for d in ("PILOT", "GROUND")}
-                pid = plan_id
-                replies = yield from self._ask_agents(turn, {
-                    d: (lambda d=d: self.agents[d].act(s, turn, self._bus(turn), proposal, pid, own[d]))
-                    for d in ("PILOT", "GROUND")})
-                accepts = 0
-                for d in ("PILOT", "GROUND"):
-                    msg: AgentMessage = replies[d]
-                    if msg.stance == "PROPOSE" or (msg.stance == "ACCEPT" and _key(msg.proposal) != _key(proposal)):
-                        msg.stance = "COUNTER"  # "accepting" a different plan is a counter
-                    yield self._record(msg)
-                    if msg.answering_plan != plan_id:
-                        self.stale_replies += 1
-                        yield self._note(turn, "stale_reply", f"{d} answered plan #{msg.answering_plan}, current is "
-                                         f"#{plan_id}: reply discarded.")
-                        continue
-                    if msg.stance == "ACCEPT":
-                        if own[d].hard_ok:
-                            accepts += 1
-                        else:
-                            self.safety_overrides += 1
-                            yield self._note(turn, "safety_override", f"{d} ACCEPT overridden: plan #{plan_id} breaks "
-                                             + "; ".join(c.detail for c in own[d].violations()))
-                            yield self._alarm("SAFETY_OVERRIDE", "WARNING", f"{d} accepted an unsafe plan",
-                                              "Overridden by the deterministic validator.", turn)
-                    elif not VALIDATORS[d](s, msg.proposal).hard_ok:
-                        yield self._note(turn, "invalid_counter", f"{d} counter breaks its own hard limits.")
-                if accepts < 2:
-                    last_countered = _key(proposal)
-
-                # 4. Consensus check ---------------------------------------------------------
-                full = check_all(s, proposal)
-                self.log.add(turn, "SYSTEM", "validation", {
-                    "plan_id": plan_id, "proposal": proposal.model_dump(),
-                    **{d: {"hard_ok": r.hard_ok, "violations": [c.detail for c in r.violations()],
-                           "warnings": [c.detail for c in r.warnings()], "metrics": r.metrics} for d, r in full.items()}})
-                yield ("validation", {"turn": turn, "plan_id": plan_id, "reports": full})
-                if accepts == 2 and is_safe(full):
-                    risks = self._risks(full)
-                    if self.autonomy == Autonomy.STEP_BY_STEP or (self.autonomy == Autonomy.SUPERVISED and risks):
-                        opts = [DecisionOption(id="approve", label=f"Approve plan #{plan_id}",
-                                               description=self._describe(proposal), proposal=proposal)]
-                        if turn < MAX_TURNS:
-                            opts.append(DecisionOption(id="continue", label="Reject, keep negotiating",
-                                                       description="Send the specialists back for another turn."))
-                        opts += [o for o in self._exit_options() if o.id == "fallback"]
-                        req = DecisionRequest(code="CONSENSUS_REVIEW", severity="WARNING" if risks else "INFO",
-                                              turn=turn, title=f"Specialists agree on plan #{plan_id}",
-                                              briefing=[self._describe(proposal)] + (risks or ["No risk flags."]),
-                                              options=opts, default="approve")
-                        choice = yield from self._decide(req)
-                        if choice == "continue":
-                            yield self._note(turn, "human_rejected", f"Plan #{plan_id} rejected by the human "
-                                             "supervisor; renegotiate.")
-                            last_countered = _key(proposal)
-                            continue
-                        if choice == "fallback":
-                            raise _Stop("fallback")
-                    yield self._note(turn, "consensus", f"Plan #{plan_id} agreed by all three specialists and passes "
-                                     f"every hard check (turn {turn}/{MAX_TURNS}).")
-                    return self._finish("CONSENSUS", "agent consensus", turn, proposal)
-                if accepts == 2:
-                    yield self._note(turn, "safety_block", "Unanimous ACCEPT but cross-domain validation failed: "
-                                     + "; ".join(c.detail for r in full.values() for c in r.violations()))
-
-                if self.autonomy == Autonomy.STEP_BY_STEP and turn < MAX_TURNS:
-                    req = DecisionRequest(code="TURN_REVIEW", severity="INFO", turn=turn,
-                                          title=f"Turn {turn} ended without agreement",
-                                          briefing=[f"Plan #{plan_id}: {self._describe(proposal)}",
-                                                    *(render_message(m, s).splitlines()[0] for m in self.messages
-                                                      if m.turn == turn)],
-                                          options=[DecisionOption(id="continue", label="Continue to the next turn",
-                                                                  description="Chief of Staff briefs, ATC re-tables.")]
-                                          + self._exit_options(), default="continue")
-                    choice = yield from self._decide(req)
-                    if choice != "continue":
-                        raise _Stop(choice)
+            for self.round in range(1, MAX_ROUNDS + 1):
+                agreed = yield from self._debate()
+                if agreed is None:
+                    return (yield from self._fallback(self.turn, f"No safe consensus within {MAX_TURNS} turns "
+                                                                 f"in round {self.round}."))
+                proposal, full = agreed
+                accepted, source = yield from self._ratify(proposal, full)
+                if accepted:
+                    return self._finish("CONSENSUS", source, self.turn, proposal)
         except _Stop as stop:
-            return (yield from self._stop(max(turn, 1), stop))
-        return (yield from self._fallback(MAX_TURNS, f"No safe consensus within {MAX_TURNS} turns."))
+            return (yield from self._stop(max(self.turn, 1), stop))
+        same = _key(self.reference.proposal) in self.rejected
+        return (yield from self._fallback(self.turn, f"The stakeholders rejected the agreed plan in all {MAX_ROUNDS} "
+                                          f"rounds. Last objections: {self.objections}"
+                                          + (" The planner's plan is one they rejected." if same else "")))
+
+    def _debate(self) -> Iterator[Event]:
+        """One round of up to MAX_TURNS turns. Returns (proposal, reports) on consensus, otherwise None."""
+        s = self.s
+        for round_turn in range(1, MAX_TURNS + 1):
+            if self._over_budget():
+                yield self._alarm("TIME_BUDGET", "ALARM", "Negotiation time budget exceeded",
+                                  f"{time.monotonic() - self.started:.1f}s > {self.deadline_s:.0f}s budget", self.turn + 1)
+                raise _Stop("keep_partial" if self.best_partial() else "fallback")
+            if round_turn > 1 or self.round > 1:
+                yield from self._moderate(self.turn, opening=False, remaining=MAX_TURNS - round_turn + 1,
+                                          objections=self.objections if round_turn == 1 else "")
+            self.turn += 1
+            self.round_turn = round_turn
+            turn = self.turn
+            yield ("turn", {"turn": turn, "round": self.round, "round_turn": round_turn})
+
+            # 1. ATC tables a plan --------------------------------------------------
+            on_table, plan_id = self.on_table, self.plan_id
+            prev = VALIDATORS["ATC"](s, on_table) if on_table else None
+            got = yield from self._ask_agents(turn, {"ATC": lambda: self.agents["ATC"].act(
+                s, turn, self._bus(turn), on_table, plan_id, prev)})
+            atc_msg: AgentMessage = got["ATC"]
+            self.plan_id += 1
+            plan_id = self.plan_id
+            atc_msg.stance, atc_msg.plan_id, atc_msg.answering_plan = "PROPOSE", plan_id, 0
+            yield self._record(atc_msg)
+            proposal = atc_msg.proposal
+
+            atc_report = VALIDATORS["ATC"](s, proposal)
+            if not atc_report.hard_ok:
+                yield self._note(turn, "safety_block", f"Plan #{plan_id} blocked by the ATC validator: "
+                                 + "; ".join(c.detail for c in atc_report.violations()))
+                continue
+            if self.last_countered == _key(proposal):
+                self.deadlock = True
+                yield self._alarm("DEADLOCK", "ALARM", "Negotiation deadlock",
+                                  f"ATC re-tabled plan {self._describe(proposal)} unchanged after it was countered.",
+                                  turn)
+                opts = self._exit_options()
+                if round_turn < MAX_TURNS:
+                    opts.insert(0, DecisionOption(id="one_more_turn", label="Allow one more turn",
+                                                  description="Let the specialists try once more."))
+                req = DecisionRequest(code="DEADLOCK", severity="ALARM", turn=turn, title="Specialists are stuck",
+                                      briefing=[f"Plan #{plan_id} repeats a plan that was already countered.",
+                                                "Continuing unchanged would burn turns without progress."],
+                                      options=opts, default="keep_partial" if self.best_partial() else "fallback")
+                choice = yield from self._decide(req)
+                if choice != "one_more_turn":
+                    raise _Stop(choice)
+            self.on_table = proposal
+
+            # 2-3. Flight Crew + AOCC answer in parallel ----------------------------
+            own = {d: VALIDATORS[d](s, proposal) for d in ("PILOT", "GROUND")}
+            replies = yield from self._ask_agents(turn, {
+                d: (lambda d=d: self.agents[d].act(s, turn, self._bus(turn), proposal, plan_id, own[d]))
+                for d in ("PILOT", "GROUND")})
+            accepts = 0
+            for d in ("PILOT", "GROUND"):
+                msg: AgentMessage = replies[d]
+                if msg.stance == "PROPOSE" or (msg.stance == "ACCEPT" and _key(msg.proposal) != _key(proposal)):
+                    msg.stance = "COUNTER"  # "accepting" a different plan is a counter
+                yield self._record(msg)
+                if msg.answering_plan != plan_id:
+                    self.stale_replies += 1
+                    yield self._note(turn, "stale_reply", f"{d} answered plan #{msg.answering_plan}, current is "
+                                     f"#{plan_id}: reply discarded.")
+                    continue
+                if msg.stance == "ACCEPT":
+                    if own[d].hard_ok:
+                        accepts += 1
+                    else:
+                        self.safety_overrides += 1
+                        yield self._note(turn, "safety_override", f"{d} ACCEPT overridden: plan #{plan_id} breaks "
+                                         + "; ".join(c.detail for c in own[d].violations()))
+                        yield self._alarm("SAFETY_OVERRIDE", "WARNING", f"{d} accepted an unsafe plan",
+                                          "Overridden by the deterministic validator.", turn)
+                elif not VALIDATORS[d](s, msg.proposal).hard_ok:
+                    yield self._note(turn, "invalid_counter", f"{d} counter breaks its own hard limits.")
+            if accepts < 2:
+                self.last_countered = _key(proposal)
+
+            # 4. Consensus check ---------------------------------------------------------
+            full = check_all(s, proposal)
+            self.log.add(turn, "SYSTEM", "validation", {
+                "plan_id": plan_id, "proposal": proposal.model_dump(),
+                **{d: {"hard_ok": r.hard_ok, "violations": [c.detail for c in r.violations()],
+                       "warnings": [c.detail for c in r.warnings()], "metrics": r.metrics} for d, r in full.items()}})
+            yield ("validation", {"turn": turn, "plan_id": plan_id, "reports": full})
+            if accepts == 2 and is_safe(full):
+                yield self._note(turn, "consensus", f"Plan #{plan_id} agreed by all three specialists and passes "
+                                 f"every hard check (round {self.round}, turn {round_turn}/{MAX_TURNS}). Going to "
+                                 "the stakeholders to ratify.")
+                return proposal, full
+            if accepts == 2:
+                yield self._note(turn, "safety_block", "Unanimous ACCEPT but cross-domain validation failed: "
+                                 + "; ".join(c.detail for r in full.values() for c in r.violations()))
+
+            if self.autonomy == Autonomy.STEP_BY_STEP and round_turn < MAX_TURNS:
+                req = DecisionRequest(code="TURN_REVIEW", severity="INFO", turn=turn,
+                                      title=f"Turn {turn} ended without agreement",
+                                      briefing=[f"Plan #{plan_id}: {self._describe(proposal)}",
+                                                *(render_message(m, s).splitlines()[0] for m in self.messages
+                                                  if m.turn == turn)],
+                                      options=[DecisionOption(id="continue", label="Continue to the next turn",
+                                                              description="Chief of Staff briefs, ATC re-tables.")]
+                                      + self._exit_options(), default="continue")
+                choice = yield from self._decide(req)
+                if choice != "continue":
+                    raise _Stop(choice)
+        return None
+
+    def _ratification_request(self, proposal: Proposal, full: dict[Domain, DomainReport]) -> Iterator[Event]:
+        """Build the Chief of Staff's brief. The narrative is optional: without it the facts still go out."""
+        s, turn = self.s, self.turn
+        pm, gm = full["PILOT"].metrics, full["GROUND"].metrics
+        facts = [f"All {sum(c.hard for r in full.values() for c in r.checks)} hard checks pass.",
+                 f"Holding {pm['holding_min']} min; fuel margin {pm['fuel_margin_min']} min above protected reserves.",
+                 f"Connections missed: {pm['missed_connection_pax']} pax. Ground overtime: {gm['crew_overtime_min']} min. "
+                 f"Next-leg delay: {gm['next_leg_delay_min']} min.",
+                 f"Priced cost of the trade-offs: ${cost(s, proposal, full):,.0f} "
+                 f"(deterministic best: {f'${self.reference.cost:,.0f}' if self.reference.cost is not None else 'n/a'})."]
+        positions = [StakeholderPosition(agent=m.agent, stance=m.stance, rationale=m.rationale, concession=m.concession,
+                                         constraints=[f"{c.name}={c.value}" for c in m.constraints])
+                     for m in self.messages if m.turn == turn]
+        req = RatificationRequest(round=self.round, turn=turn, plan_id=self.plan_id, proposal=proposal,
+                                  plan_text=self._describe(proposal), facts=facts, risks=self._risks(full),
+                                  positions=positions)
+        mod = self.agents.get("MODERATOR")
+        if isinstance(mod, ModeratorAgent):
+            yield ("thinking", {"agents": ["MODERATOR"], "turn": turn})
+            try:
+                summary, metric = mod.summarise_consensus(s, turn, req.plan_text, render_positions(positions),
+                                                          self.decision_support())
+            except AgentError as e:  # advisory role: never blocks ratification
+                ev = self._metric(e.metric)
+                if ev:
+                    yield ev
+                yield self._note(turn, "moderator_unavailable", f"Chief of Staff summary unavailable ({e}); "
+                                 "sending the facts and positions without it.")
+            else:
+                req.chief_summary, req.chief_reasoning = summary.summary, summary.chief_reasoning
+                ev = self._metric(metric)
+                if ev:
+                    yield ev
+        return req
+
+    def _agent_votes(self, req: RatificationRequest, domains: list[str]) -> dict[str, StakeholderVote]:
+        """AI stakeholders vote in parallel. One that cannot answer has not agreed: silence never ratifies a plan."""
+        briefing = agent_briefing(req)
+        with ThreadPoolExecutor(max_workers=len(domains)) as pool:
+            futures = {d: pool.submit(self.agents[d].ratify, self.s, req.turn, req.plan_id, briefing,
+                                      VALIDATORS[d](self.s, req.proposal)) for d in domains}
+            votes = {}
+            for d, f in futures.items():
+                try:
+                    votes[d] = f.result()
+                except AgentError as e:
+                    self._metric(e.metric)
+                    votes[d] = StakeholderVote(agree=False, reason=f"Did not answer ({e}).", agent=d, turn=req.turn)
+        return votes
+
+    def _ratify(self, proposal: Proposal, full: dict[Domain, DomainReport]) -> Iterator[Event]:
+        """Send the agreed plan to the stakeholders. Returns (accepted, plan source). On a rejection, records the
+        objections so the next round's Chief of Staff brief and every specialist's bus carry them."""
+        turn = self.turn
+        req = yield from self._ratification_request(proposal, full)
+        self.log.add(turn, "MODERATOR", "ratification_request", req.model_dump())
+        answers = None
+        if self.autonomy == Autonomy.AUTONOMOUS:
+            yield ("ratification_request", req)
+        else:
+            answers = yield ("ratification", req)
+        votes = {}
+        for d, a in (answers or {}).items():
+            if d in STAKEHOLDERS:
+                agree, reason = bool(a["agree"]), str(a.get("reason", "")).strip()
+                votes[d] = StakeholderVote(agree=agree, reason=reason or ("Agreed." if agree else "No reason given."),
+                                           agent=d, turn=turn, by="HUMAN")
+        missing = [d for d in STAKEHOLDERS if d not in votes]
+        if missing:
+            yield ("thinking", {"agents": missing, "turn": turn})
+            votes.update(self._agent_votes(req, missing))
+        ordered = [votes[d] for d in STAKEHOLDERS]
+        for v in ordered:
+            ev = self._metric(v.metric)
+            if ev:
+                yield ev
+            self.decisions.append(DecisionRecord(code="RATIFICATION", turn=turn, option="agree" if v.agree else "disagree",
+                                                 by="HUMAN" if v.by == "HUMAN" else "AUTO"))
+            self.log.add(turn, v.agent if v.by == "AGENT" else f"{v.agent}_HUMAN", "stakeholder_vote",
+                         v.model_dump(exclude={"metric"}) | {"plan_id": req.plan_id})
+            yield ("vote", v)
+        accepted = all(v.agree for v in ordered)
+        self.ratifications.append(RatificationRecord(round=self.round, turn=turn, plan_id=req.plan_id, proposal=proposal,
+                                                     votes=ordered, accepted=accepted))
+        if accepted:
+            who = "people" if all(v.by == "HUMAN" for v in ordered) else "AI agents" if all(
+                v.by == "AGENT" for v in ordered) else "people and AI agents"
+            yield self._note(turn, "ratified", f"Plan #{req.plan_id} ratified by all three stakeholders ({who}).")
+            return True, f"agent consensus, ratified by the stakeholders ({who})"
+        self.rejected.add(_key(proposal))
+        self.last_countered = _key(proposal)  # re-tabling it unchanged is a deadlock
+        against = [v for v in ordered if not v.agree]
+        self.objections = "; ".join(f"{v.agent}: {v.reason}" for v in against)
+        for v in against:
+            self.ledger[(v.agent, "stakeholder_objection")] = f"{v.agent} OBJECTION to plan #{req.plan_id}: {v.reason}"
+        next_step = ("A new round of debate follows." if self.round < MAX_ROUNDS else
+                     "That was the last round: the deterministic planner decides.")
+        yield self._note(turn, "stakeholder_objection", f"Plan #{req.plan_id} rejected. {self.objections}. {next_step}")
+        return False, ""
 
     def _over_budget(self) -> bool:
         if self.deadline_s is not None and time.monotonic() - self.started > self.deadline_s:
@@ -552,13 +727,14 @@ class NegotiationSession:
             risks.append(f"Next leg knock-on delay {gm['next_leg_delay_min']} min.")
         return risks
 
-    def _moderate(self, turn: int, opening: bool) -> Iterator[Event]:
+    def _moderate(self, turn: int, opening: bool, remaining: int = 0, objections: str = "") -> Iterator[Event]:
         mod = self.agents.get("MODERATOR")
         if not isinstance(mod, ModeratorAgent):
             return
         yield ("thinking", {"agents": ["MODERATOR"], "turn": turn})
         try:
-            brief = mod.brief(self.s, turn, self._bus(turn + 1), opening, support=self.decision_support())
+            brief = mod.brief(self.s, turn, self._bus(turn + 1), opening, support=self.decision_support(),
+                              remaining=remaining, objections=objections)
         except AgentError as e:  # advisory role: never blocks the negotiation
             ev = self._metric(e.metric)
             if ev:
@@ -581,8 +757,10 @@ class NegotiationSession:
 
 def negotiate(s: Scenario, agents: dict[str, BaseAgent], on_event: Optional[Callable[[str, object], None]] = None,
               autonomy: Autonomy = Autonomy.AUTONOMOUS, decide: Optional[Callable[[DecisionRequest], str]] = None,
-              save_log: bool = True, deadline_s: Optional[float] = None) -> Outcome:
-    """Run a session to completion. `decide` answers decision requests (default: the safe default)."""
+              save_log: bool = True, deadline_s: Optional[float] = None,
+              ratify: Optional[Callable[[RatificationRequest], dict]] = None) -> Outcome:
+    """Run a session to completion. `decide` answers decision requests (default: the safe default). `ratify` gives
+    the people's votes on an agreed plan (default: the AI agents vote)."""
     session = NegotiationSession(s, agents, autonomy, save_log, deadline_s)
     kind, data = session.advance()
     while True:
@@ -592,5 +770,7 @@ def negotiate(s: Scenario, agents: dict[str, BaseAgent], on_event: Optional[Call
             return data  # type: ignore[return-value]
         if kind == "decision":
             kind, data = session.advance(decide(data) if decide else data.default)
+        elif kind == "ratification":
+            kind, data = session.advance(ratify(data) if ratify else None)
         else:
             kind, data = session.advance()

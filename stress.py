@@ -130,6 +130,12 @@ class FlakyAgent:
             raise AgentError(self.domain, "timed out (injected)", timeout=True)
         return self.inner.act(*args, **kwargs)
 
+    def ratify(self, *args, **kwargs):
+        time.sleep(self.rng.uniform(*self.delay_s))
+        if self.rng.random() < self.fail_rate:
+            raise AgentError(self.domain, "timed out (injected)", timeout=True)
+        return self.inner.ratify(*args, **kwargs)
+
 
 class OutageAgent:
     """Every call fails: the agent's link is down (radar/comms outage analogue)."""
@@ -140,6 +146,8 @@ class OutageAgent:
 
     def act(self, *args, **kwargs):
         raise AgentError(self.domain, "network error: link down (injected outage)")
+
+    ratify = act
 
 
 def inject_lightning(s: Scenario, minutes: int = 40) -> Scenario:
@@ -338,7 +346,8 @@ def _core_invariants(s: Scenario, out: Outcome, budget_s: Optional[float]) -> li
     return [
         Invariant(name="never an unsafe agreed plan", passed=safe or sop,
                   detail="passes every hard check" if safe else f"SOP outcome ({out.reference.mode})"),
-        Invariant(name=f"at most {MAX_TURNS} turns", passed=out.turns_used <= MAX_TURNS, detail=f"{out.turns_used} turns"),
+        Invariant(name=f"at most {MAX_TURNS} turns per round", passed=out.turns_used <= MAX_TURNS * out.rounds,
+                  detail=f"{out.turns_used} turns in {out.rounds} round(s)"),
         Invariant(name="inside time budget", passed=budget_s is None or out.elapsed_s <= budget_s + 5,
                   detail=f"{out.elapsed_s}s" + (f" / {budget_s:.0f}s" if budget_s else "")),
         Invariant(name="log hash chain intact", passed=out.log_verified),

@@ -12,6 +12,7 @@ from functools import lru_cache
 from typing import Literal, Optional
 
 import anthropic
+import pydantic
 from pydantic import BaseModel, create_model
 
 from constraints import Domain, DomainReport, Proposal
@@ -47,6 +48,19 @@ class AgentMessage(AgentReply):
     agent: Domain
     turn: int
     plan_id: int = 0  # version assigned when this message puts a plan on the table
+    metric: Optional[CallMetric] = None
+
+
+class RatificationReply(BaseModel):
+    agree: bool
+    reason: str
+
+
+class StakeholderVote(RatificationReply):
+    """One stakeholder's answer on an agreed plan. `by` records whether a person or their AI agent gave it."""
+    agent: Domain
+    turn: int
+    by: Literal["HUMAN", "AGENT"] = "AGENT"
     metric: Optional[CallMetric] = None
 
 
@@ -99,6 +113,9 @@ OPERATING PROTOCOL (A-CDM collaborative decision; every agent follows it):
   COUNTER and set answering_plan to that plan's number. Replies to an outdated plan number are discarded.
 - Hard limit: 3 turns, then a deterministic non-AI planner decides. Converge: ACCEPT any plan that meets
   your hard limits even if it is not your preference; record the preference as a soft constraint.
+- An agreed plan then goes to the three stakeholders to ratify. If any of them objects, one new round of up
+  to 3 turns follows, and the plan that comes out of it must answer the objections on the bus. If that plan
+  is rejected too, the deterministic planner decides.
 - Publish limits as constraints so others can plan around them (hard=true only for safety, legal or
   physical limits). Quote your instruments; never estimate a figure your instruments already give.
 - Every plan is re-checked by deterministic safety code. A plan that breaks a hard limit is rejected
@@ -132,10 +149,22 @@ class BaseAgent:
                          f"(TLDT {s.clock(on_table.landing_slot_min)})")
         if own_report is not None:
             parts.append(f"## Your deterministic check of plan #{plan_id}\n{render_report(own_report)}")
-        parts.append(f"## Task (turn {turn} of 3)\n{self.task(turn, on_table, plan_id)}")
+        parts.append(f"## Task (turn {turn})\n{self.task(turn, on_table, plan_id)}")
         reply, metric = self._call("\n\n".join(parts), reply_schema(s), turn)
         data = reply.model_dump()
         return AgentMessage(**data, agent=self.domain, turn=turn, metric=metric)
+
+    def ratify(self, s: Scenario, turn: int, plan_id: int, briefing: str, own_report: DomainReport) -> StakeholderVote:
+        """Answer the Chief of Staff's summary of an agreed plan, having now seen everyone's reasoning."""
+        content = "\n\n".join([
+            f"## Your private instruments (only you can see these)\n{self.private_brief(s)}",
+            f"## Chief of Staff's summary of agreed plan #{plan_id}\n{briefing}",
+            f"## Your deterministic check of plan #{plan_id}\n{render_report(own_report)}",
+            "## Task\nYou are asked to ratify this plan. Agree unless the other stakeholders' reasoning raises a "
+            "concern for your own domain that the plan does not answer. If you disagree, state that concern in "
+            "reason precisely enough for the team to act on it. reason: at most two sentences."])
+        reply, metric = self._call(content, RatificationReply, turn)
+        return StakeholderVote(**reply.model_dump(), agent=self.domain, turn=turn, metric=metric)
 
     def task(self, turn: int, on_table: Optional[Proposal], plan_id: int) -> str:
         return (f"ACCEPT plan #{plan_id} if it meets all your hard limits (copy it unchanged into proposal). "
@@ -173,6 +202,8 @@ class BaseAgent:
             raise fail("rate limited") from e
         except anthropic.APIStatusError as e:
             raise fail(f"API error {e.status_code}: {e.message}") from e
+        except pydantic.ValidationError as e:  # truncated or off-schema reply: the fallback must still run
+            raise fail(f"malformed reply: {e.error_count()} validation error(s)") from e
         u = response.usage
         metric = CallMetric(agent=self.domain, turn=turn, model=self.model,
                             latency_s=round(time.monotonic() - started, 2), input_tokens=u.input_tokens,

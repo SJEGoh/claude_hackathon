@@ -19,12 +19,14 @@ import costs
 from emergency import KIND_LABEL, plan_emergency
 from escalation import Alarm, dispatch
 from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, flights, get_scenario, hero, make_engine_agents,
-                       render_emergency, render_event, render_outcome, timeline)
+                       ratification_form, render_emergency, render_event, render_outcome, timeline)
 
 AUTONOMY_HELP = {
-    "AUTONOMOUS": "Never pauses. Every decision point takes its safe default; alarms still go out.",
-    "SUPERVISED": "Pauses only on risk: an agreed plan near a limit, deadlock, agent failure or timeout, fallback.",
-    "STEP_BY_STEP": "Pauses after every turn and before anything is committed.",
+    "AUTONOMOUS": "Never pauses. The AI agents vote on the agreed plan and every decision point takes its safe "
+                  "default; alarms still go out.",
+    "SUPERVISED": "The controller, pilot and ground lead vote on the agreed plan. Also pauses on risk: deadlock, agent "
+                  "failure or timeout, fallback.",
+    "STEP_BY_STEP": "Everything in Supervised, and pauses after every turn.",
 }
 
 
@@ -91,17 +93,18 @@ with st.sidebar:
 s = get_scenario(pick, weather_mode)
 scen_key = (pick, weather_mode)
 if st.session_state.get("cr_scen_key") != scen_key:
-    st.session_state.update(cr_scen_key=scen_key, sess=None, events=[], pending=None, outcome=None, choice=None,
-                            played=set(), cr_emergency=None)
+    st.session_state.update(cr_scen_key=scen_key, sess=None, events=[], pending=None, ratify=None, outcome=None,
+                            choice=None, played=set(), cr_emergency=None)
 
 # ============================================================================
 # Header
 # ============================================================================
 hero(f"Control room · AUTONOMOUS SG 2026 · Challenge #2 · three independent specialists, a Chief of Staff, max "
-     f"{MAX_TURNS} turns, deterministic safety engine, human oversight tiers", compact=True)
+     f"{MAX_TURNS} turns per round, stakeholder ratification, deterministic safety engine, human oversight tiers",
+     compact=True)
 fids_board(s, st.session_state.get("outcome"), emergency=st.session_state.get("cr_emergency"),
            running=st.session_state.get("sess") is not None,
-           pending=st.session_state.get("pending") is not None)
+           pending=st.session_state.get("pending") is not None or st.session_state.get("ratify") is not None)
 m = st.columns(6)
 m[0].metric("Flight", s.flight, f"{s.origin} → {s.destination}", delta_color="off")
 m[1].metric("SIBT", s.clock(0), s.date, delta_color="off")
@@ -132,7 +135,7 @@ with tab_neg:
     b1, b2, b3, b4 = st.columns([1.2, 0.8, 1.2, 1.4])
     start = b1.button("▶ Start negotiation", type="primary", disabled=use_claude and not key_ok)
     if b2.button("↺ Reset"):
-        st.session_state.update(sess=None, events=[], pending=None, outcome=None, choice=None, played=set(),
+        st.session_state.update(sess=None, events=[], pending=None, ratify=None, outcome=None, choice=None, played=set(),
                                 cr_emergency=None)
         st.rerun()
     em_kind = b3.selectbox("Emergency", list(KIND_LABEL), format_func=KIND_LABEL.get, label_visibility="collapsed")
@@ -142,7 +145,7 @@ with tab_neg:
                        detail=f"Divert {plan.divert_to}" if plan.divert_to else
                        f"RWY {plan.proposal.runway} {plan.landing_clock}, stand {plan.proposal.gate}",
                        flight=s.flight, turn=0))
-        st.session_state.update(sess=None, pending=None, cr_emergency=plan, cr_em_live=True)
+        st.session_state.update(sess=None, pending=None, ratify=None, cr_emergency=plan, cr_em_live=True)
         st.rerun()
     if st.session_state.get("cr_emergency") is not None:
         render_emergency(s, st.session_state.cr_emergency, live=st.session_state.pop("cr_em_live", False),
@@ -165,6 +168,10 @@ with tab_neg:
             else:
                 st.session_state.events.append(ev)
                 render(k, d, live=True)
+            if k == "ratification":
+                status.empty()
+                st.session_state.ratify = d
+                return
             if k == "decision":
                 status.empty()
                 st.session_state.pending = d
@@ -183,13 +190,19 @@ with tab_neg:
         else:
             agents = make_engine_agents(kind, "", "")
         st.session_state.update(sess=NegotiationSession(s, agents, Autonomy(autonomy)), events=[], pending=None,
-                                outcome=None)
+                                ratify=None, outcome=None)
         pump()
         st.rerun()
     elif st.session_state.choice is not None and st.session_state.sess is not None:
         choice, st.session_state.choice = st.session_state.choice, None
         pump(choice)
         st.rerun()
+
+    if st.session_state.get("ratify") is not None:
+        votes = ratification_form(st.session_state.ratify, "cr_ratify")
+        if votes is not None:
+            st.session_state.update(choice=votes, ratify=None)
+            st.rerun()
 
     req = st.session_state.pending
     if req is not None:

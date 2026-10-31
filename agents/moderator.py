@@ -2,8 +2,9 @@
 
 It sees ONLY public information (the DOT disruption facts, the public weather summary and the bus), none
 of the domain agents' private instruments. It opens the session, and after each turn without consensus it
-names the open conflicts and may suggest a bridge plan. It has no vote: consensus still needs all three
-domain agents plus the deterministic safety checks.
+names the open conflicts and may suggest a bridge plan. When the specialists agree, it summarises the plan and
+everyone's reasoning for the three stakeholders to ratify, and collates any objections into a new round. It has
+no vote: consensus still needs all three domain agents plus the deterministic safety checks.
 """
 from __future__ import annotations
 
@@ -35,6 +36,11 @@ class ModeratorMessage(ModeratorReply):
     metric: Optional[CallMetric] = None
 
 
+class ConsensusSummary(BaseModel):
+    summary: str
+    chief_reasoning: str
+
+
 def _moderator_schema(s: Scenario) -> type[BaseModel]:
     plan = reply_schema(s).model_fields["proposal"].annotation  # same real-ID enums as the agents
     return create_model("Brief", summary=(str, ...), open_conflicts=(list[str], ...),
@@ -61,11 +67,17 @@ class ModeratorAgent(BaseAgent):
                 f"{s.weather_delay_min} min, LATE_AIRCRAFT_DELAY {s.late_aircraft_delay_min} min. "
                 f"Weather: {s.weather_attribution} Runways in use: {', '.join(r.id for r in s.runways)}.")
 
-    def brief(self, s: Scenario, turn: int, bus: str, opening: bool, support: str = "") -> ModeratorMessage:
+    def brief(self, s: Scenario, turn: int, bus: str, opening: bool, support: str = "", remaining: int = 0,
+              objections: str = "") -> ModeratorMessage:
         task = ("Open the call: summarise the disruption and tell each specialist what to publish first so the "
                 "call can close in as few turns as possible. bridge_proposal must be null."
                 if opening else
-                f"Turn {turn} ended without consensus; {3 - turn} turn(s) remain before the deterministic planner "
+                f"The stakeholders rejected the agreed plan. Their objections:\n{objections}\nCollate them into "
+                f"open_conflicts, one per concern. A new round of {remaining} turn(s) starts now, and a second "
+                "rejection hands over to the deterministic planner. Propose a different bridge plan if the published "
+                "constraints allow one, and tell each specialist what the next plan must answer."
+                if objections else
+                f"Turn {turn} ended without consensus; {remaining} turn(s) remain before the deterministic planner "
                 "takes over. Summarise, list open conflicts, propose a bridge plan if the published constraints "
                 "allow one, and give each specialist a directive for the next turn.")
         content = (f"## Public disruption facts\n{self.public_brief(s)}\n\n## Public bus\n{bus or '(empty)'}"
@@ -74,6 +86,18 @@ class ModeratorAgent(BaseAgent):
         reply, metric = self._call(content, _moderator_schema(s), turn, system=f"{self.role}\n\n{SAFETY_CHARTER}")
         data = reply.model_dump()
         return ModeratorMessage(**data, turn=turn, metric=metric)
+
+    def summarise_consensus(self, s: Scenario, turn: int, plan: str, positions: str, support: str = ""
+                            ) -> tuple[ConsensusSummary, CallMetric]:
+        """Narrative only: every safety figure shown to stakeholders comes from the deterministic checks."""
+        content = (f"## Public disruption facts\n{self.public_brief(s)}\n\n## Agreed plan\n{plan}\n\n"
+                   f"## What each specialist said\n{positions}"
+                   + (f"\n\n## Decision support (deterministic)\n{support}" if support else "")
+                   + "\n\n## Task\nThe specialists agree. Brief the three stakeholders before they ratify. summary: "
+                     "what was agreed and the main trade-off, at most two sentences. chief_reasoning: why you think "
+                     "this is the right call or what you would watch, at most two sentences. Quote no figure that "
+                     "is not given above.")
+        return self._call(content, ConsensusSummary, turn, system=f"{self.role}\n\n{SAFETY_CHARTER}")
 
 
 def render_brief(m: ModeratorMessage) -> str:

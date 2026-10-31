@@ -1,9 +1,23 @@
 # A-CDM Multi-Agent Disruption Negotiation (AUTONOMOUS SG 2026 · Challenge #2)
 
 Three independent Claude specialists negotiate a revised landing time, runway and stand for a disrupted
-US DOT 2015 flight, in at most 3 turns, chaired by a Chief of Staff. Plain code checks every plan, a
-deterministic planner takes over when the agents don't converge, and a human can supervise at chosen
-points.
+US DOT 2015 flight, in at most 3 turns, chaired by a Chief of Staff. The controller, pilot and ground lead then
+ratify the agreed plan. Plain code checks every plan, and a deterministic planner takes over when the agents don't
+converge or the stakeholders reject the plan twice.
+
+## From consensus to a committed plan
+1. **Debate:** up to 3 turns. No consensus means the deterministic planner decides.
+2. **Summary:** the Chief of Staff sends the stakeholders the plan, every specialist's reasoning and its own. Safety
+   figures come from code; Claude only writes the narrative, and the brief still goes out if that call fails.
+3. **Vote:** each stakeholder agrees or disagrees with a reason. All three agree: the plan is committed.
+4. **New round:** any disagreement rejects the plan. The Chief collates the objections, which go to every specialist,
+   and a new debate of up to 3 turns starts. The rejected plan can't be kept as the "best safe plan so far".
+5. **Second vote:** if that plan is rejected too, the deterministic planner decides. Its plan can match one the
+   stakeholders rejected, because it can't read their reasons; the fallback reason says so when that happens.
+
+People vote in SUPERVISED and STEP_BY_STEP. In AUTONOMOUS, and for anyone left out of a vote, the AI agent answers, and
+one that can't answer counts as disagreeing. The log and the outcome record who gave each vote. The vote card is one
+shared screen with no sign-in, so the log can't tell which person pressed which button.
 
 | Agent | Role (A-CDM) | Private instruments |
 |---|---|---|
@@ -38,7 +52,7 @@ points.
 
 ## Real-world stress tests (`stress.py`, Control room → 🔥 Stress tests)
 Each case replays a documented failure mode against the live engine and checks: no crash · never an unsafe agreed
-plan · ≤ 3 turns · inside the time budget · log intact.
+plan · ≤ 3 turns per round · inside the time budget · log intact.
 | Case | Real-world basis | What must happen |
 |---|---|---|
 | NATS_RECORD | UK NATS Aug 2023: two beacons with one name crashed primary and identical backup | bad/ambiguous records quarantined, rest of batch continues; fallback is independent code |
@@ -64,9 +78,11 @@ plan · ≤ 3 turns · inside the time budget · log intact.
 | Flight crew max duty | Hard check `flight_crew_duty` |
 | Ground crew shift, overtime multiplier | Shift changes; overtime is a soft check and a cost, not a hard limit |
 | Gate change notice | Hard check `gate_change_notice` |
-| One turn = each agent sends one message; 3 turns, then the fallback | `negotiation.py` |
+| One turn = each agent sends one message; 3 turns, then the fallback | `negotiation.py`, per round of debate |
 
 **What this team added or assumed.** The workbook asks teams to state these in the demo:
+- **Turn limit (changed):** the first consensus must come within the workbook's 3 turns. If the stakeholders then reject
+  it, a second round gets up to 3 more, so a flight can take up to 6 turns. Ratification itself is not a turn.
 - **Stricter than the workbook:** the alternate's fuel (ALTN) is protected as well as the final reserve; the 5%
   contingency is protected rather than available for holding; IMC adds 1 min of spacing and lowers the background
   arrival rate; holding in severe PIREPs is capped at 10 min; crosswind and tailwind limits.
@@ -94,7 +110,7 @@ plan · ≤ 3 turns · inside the time budget · log intact.
   availability, gate-change notice.
 - Real-ID enums: agents can only name runways and stands that exist in the scenario. Plan numbers make stale replies
   get discarded.
-- Autonomy tiers: AUTONOMOUS, SUPERVISED and STEP_BY_STEP. Decision points cover consensus review, turn review,
+- Autonomy tiers: AUTONOMOUS, SUPERVISED and STEP_BY_STEP. Decision points cover stakeholder votes, turn review,
   deadlock, agent timeout or failure (wait and retry, keep the best safe plan, or fallback) and fallback review. Humans
   are only offered plans that pass every hard check.
 - Alarms (`escalation.py`): on-screen banner, toast and sound, a webhook, a macOS notification and a tap-to-call duty
@@ -113,5 +129,5 @@ python run_negotiation.py --row 40 --agents rules   # offline, free
 python weather_poller.py --airports ORD ATL --interval 300
 python batch_eval.py --agents rules --n 5           # free baseline
 python batch_eval.py --split test --n 4             # Claude agents on held-out flights (~$0.2-0.5 per flight)
-python -m unittest discover tests         # 39 offline tests
+python -m unittest discover tests         # 53 offline tests
 ```

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from agents.base import AgentMessage, ConstraintClaim
+from agents.base import AgentMessage, ConstraintClaim, StakeholderVote
 from constraints import Domain, DomainReport, Proposal, check_atc, check_ground, check_pilot
 from scenario import Scenario
 
@@ -24,6 +24,10 @@ class _Rule:
                   for c in (report.checks if report else []) if not c.passed]
         return AgentMessage(stance=stance, answering_plan=plan_ref, proposal=p, constraints=claims,
                             concession="-", rationale=why, agent=self.domain, turn=turn)
+
+    def ratify(self, s: Scenario, turn: int, plan_id: int, briefing: str, own_report: DomainReport) -> StakeholderVote:
+        why = "Within my limits." if own_report.hard_ok else "; ".join(c.detail for c in own_report.violations())
+        return StakeholderVote(agree=own_report.hard_ok, reason=why, agent=self.domain, turn=turn)
 
 
 class RuleATC(_Rule):

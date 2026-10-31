@@ -44,7 +44,7 @@ def run_one(row: pd.Series, agents_kind: str, model: str, weather: str) -> dict:
         "flight": s.flight, "date": s.date, "route": f"{s.origin}-{s.destination}", "bucket": row.BUCKET,
         "weather_delay": s.weather_delay_min, "late_aircraft_delay": s.late_aircraft_delay_min,
         "dest_weather": s.weather_at_destination, "status": out.status, "plan_source": out.plan_source,
-        "turns": out.turns_used, "deadlock": out.deadlock, "safety_overrides": out.safety_overrides,
+        "turns": out.turns_used, "rounds": out.rounds, "deadlock": out.deadlock, "safety_overrides": out.safety_overrides,
         "stale_replies": out.stale_replies, "alarms": len(out.alarms), "cost": out.cost,
         "optimum_cost": out.reference.cost, "cost_gap": gap, "plan_safe": bool(out.reports) and all(
             r.hard_ok for r in out.reports.values()), "usd": out.usage["cost_usd"],

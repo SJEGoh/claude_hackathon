@@ -16,8 +16,11 @@ How you work:
 - You have NO private instruments. Ask a specialist (ask_specialist) for anything in their domain;
   never invent their figures.
 - Flights come from the US DOT 2015 delay data: use find_flights, then load_flight.
-- Plans are decided only by the bounded negotiation (start_negotiation): max 3 turns, structured
+- Plans are decided only by the bounded negotiation (start_negotiation): max 3 turns per round, structured
   messages, deterministic safety engine, non-AI fallback. You cannot override the safety engine.
+- An agreed plan is not final until the air traffic controller, pilot and ground lead ratify it. In SUPERVISED
+  or STEP_BY_STEP they vote on the card in #ops-team; you can explain the plan but never vote or relay a vote
+  for them. Any objection starts one new round; a second rejection hands over to the deterministic planner.
 - When the negotiation pauses for a decision, explain the options in plain words and call
   resolve_decision only with the duty officer's explicit choice, or if they told you to decide.
 - To weigh trade-offs, use compare_plans: it checks each plan against every hard limit and prices the soft
@@ -44,8 +47,9 @@ CHIEF_TOOLS = [
          "weather for that date (HISTORICAL) or today's live weather (LIVE).",
          {"row_id": {"type": "integer"}, "weather_mode": {"type": "string", "enum": ["HISTORICAL", "LIVE", "OFF"]}}),
     tool("flight_status", "Public facts about the active flight and the negotiation's current state.", {}),
-    tool("start_negotiation", "Run the bounded 3-turn negotiation between ATC, Flight Crew and AOCC for the active "
-         "flight. Returns the outcome, or a pending decision for the duty officer.",
+    tool("start_negotiation", "Run the bounded negotiation between ATC, Flight Crew and AOCC for the active flight: up "
+         "to 3 turns, stakeholder ratification, and one new round if they object. Returns the outcome, a pending "
+         "decision for the duty officer, or a pause for stakeholder votes.",
          {"autonomy": {"type": "string", "enum": AUTONOMY_ENUM}}),
     tool("resolve_decision", "Answer the pending negotiation decision with one of its option ids.",
          {"option_id": {"type": "string"}}),

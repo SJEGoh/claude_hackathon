@@ -13,12 +13,13 @@ import profiles
 from constraints import Proposal, cost_breakdown, plan_robustness
 from emergency import KIND_LABEL, EmergencyPlan
 from escalation import duty_phone
-from negotiation import MAX_TURNS
+from negotiation import MAX_TURNS, STAKEHOLDERS
 from scenario import Scenario, build_scenario, load_disrupted_flights, split_of
 
 ROOT = Path(__file__).parent
 STANCE = {"PROPOSE": "blue", "ACCEPT": "green", "COUNTER": "orange"}
 ENGINES = ["Claude agents", "Rule-based (free)", "Safety drill: rogue agents (free)"]
+STAKEHOLDER_TITLE = {"ATC": "Air traffic controller", "PILOT": "Pilot", "GROUND": "Ground operations lead"}
 
 
 class _Profile(dict):
@@ -178,7 +179,28 @@ def plan_text(s: Scenario, p) -> str:
 def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool = True, autonomy: str = "") -> None:
     """Render one negotiation event. Chat-style events open their own chat bubble."""
     if kind == "turn":
-        st.markdown(f"##### — Turn {data['turn']} / {MAX_TURNS} —")
+        st.markdown(f"##### — Round {data['round']} · turn {data['round_turn']} / {MAX_TURNS} —")
+    elif kind in ("ratification", "ratification_request"):
+        with st.chat_message("MODERATOR", avatar=AVATARS["MODERATOR"]):
+            st.markdown(f"**{NAMES['MODERATOR']}** · Plan #{data.plan_id} is agreed and needs all three stakeholders "
+                        f"to ratify it: {plan_text(s, data.proposal)}")
+            if data.chief_summary:
+                st.write(data.chief_summary)
+            if data.chief_reasoning:
+                st.markdown(f"*My reasoning:* {data.chief_reasoning}")
+            for fact in data.facts:
+                st.markdown(f"- {fact}")
+            for risk in data.risks:
+                st.markdown(f"- ⚠️ {risk}")
+            for p in data.positions:
+                st.markdown(f"**{NAMES[p.agent]}** ({p.stance.lower()}): {p.rationale} *Concession:* {p.concession}")
+                if p.constraints:
+                    st.caption("Published: " + "; ".join(p.constraints))
+    elif kind == "vote":
+        with st.chat_message(data.agent, avatar=AVATARS[data.agent]):
+            who = "person" if data.by == "HUMAN" else "AI agent"
+            st.markdown(f"**{NAMES[data.agent]}** ({who}) "
+                        + (":green-badge[AGREE]" if data.agree else ":red-badge[DISAGREE]") + f" {data.reason}")
     elif kind == "message":
         with st.chat_message(data.agent, avatar=AVATARS[data.agent]):
             tag = f"plan #{data.plan_id}" if data.stance == "PROPOSE" else f"re #{data.answering_plan}"
@@ -227,11 +249,42 @@ def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool =
         st.caption(f"👤 Human decision requested: {data.title}")
 
 
+def ratification_form(req, key: str) -> dict | None:
+    """One panel per stakeholder: agree or disagree with a reason. Returns their votes once all three are complete."""
+    answers = {}
+    with st.container(border=True):
+        st.markdown(f"#### 👥 Stakeholder votes · plan #{req.plan_id} · round {req.round}")
+        st.caption("Any disagreement sends the plan back for a new round. If the next plan is rejected too, the "
+                   "deterministic planner decides.")
+        plan_key = f"{key}_{req.round}_{req.plan_id}"  # a new plan gets a blank card: no vote carries over
+        with st.form(plan_key):
+            for col, agent in zip(st.columns(3), STAKEHOLDERS):
+                with col:
+                    st.markdown(f"**{STAKEHOLDER_TITLE[agent]}**")
+                    choice = st.radio("Vote", ["Agree", "Disagree"], index=None, horizontal=True,
+                                      key=f"{plan_key}_{agent}_vote")
+                    reason = st.text_area("Reason (required to disagree)", key=f"{plan_key}_{agent}_reason", height=90)
+                    answers[agent] = (choice, reason.strip())
+            send = st.form_submit_button("Send votes", type="primary")
+    if not send:
+        return None
+    unanswered = [STAKEHOLDER_TITLE[a] for a, (choice, _) in answers.items() if choice is None]
+    unexplained = [STAKEHOLDER_TITLE[a] for a, (choice, reason) in answers.items() if choice == "Disagree" and not reason]
+    if unanswered or unexplained:
+        if unanswered:
+            st.warning(f"Still needs a vote: {', '.join(unanswered)}.")
+        if unexplained:
+            st.warning(f"Still needs a reason for disagreeing: {', '.join(unexplained)}.")
+        return None
+    return {a: {"agree": choice == "Agree", "reason": reason} for a, (choice, reason) in answers.items()}
+
+
 def render_outcome(s: Scenario, out) -> None:
     p = out.proposal
     where = plan_text(s, p) if p.runway != "DIVERT" else f"**DIVERT to {p.gate}**"
     {"CONSENSUS": st.success, "FALLBACK": st.error, "HUMAN_DECISION": st.warning}[out.status](
-        f"**{out.status.replace('_', ' ')}** · {out.plan_source} · turn {out.turns_used}: {where}"
+        f"**{out.status.replace('_', ' ')}** · {out.plan_source} · round {out.rounds}, {out.turns_used} turn(s) in "
+        f"total: {where}"
         + (f"\n\n{out.reason}" if out.reason else ""))
     c = st.columns(5)
     pm = out.reports["PILOT"].metrics if out.reports else {}
