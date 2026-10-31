@@ -31,7 +31,8 @@ from pydantic import BaseModel
 
 from agents import AgentError, AgentMessage, BaseAgent, ModeratorAgent, ModeratorMessage, render_brief, render_message
 from constraints import (
-    VALIDATORS, Domain, DomainReport, FallbackResult, Proposal, check_all, cost, deterministic_plan, is_safe,
+    VALIDATORS, Domain, DomainReport, FallbackResult, Proposal, check_all, cost, cost_breakdown, deterministic_plan,
+    is_safe,
 )
 from escalation import Alarm, dispatch
 from monitoring import CallMetric, summarise
@@ -145,6 +146,7 @@ class Outcome(BaseModel):
     metrics: list[CallMetric]
     usage: dict
     deadlock: bool
+    deadline_hit: bool = False
     safety_overrides: int
     stale_replies: int
     log_path: Optional[str] = None
@@ -164,8 +166,10 @@ class NegotiationSession:
     `advance(option_id)` with the human's choice. kind == "outcome" ends the session."""
 
     def __init__(self, s: Scenario, agents: dict[str, BaseAgent], autonomy: Autonomy = Autonomy.AUTONOMOUS,
-                 save_log: bool = True):
+                 save_log: bool = True, deadline_s: Optional[float] = None):
         self.s, self.agents, self.autonomy, self.save_log = s, agents, Autonomy(autonomy), save_log
+        self.deadline_s = deadline_s  # hard wall-clock budget for the whole negotiation (time-critical ops)
+        self.deadline_hit = False
         self.log = ConsensusLog()
         self.messages: list[AgentMessage] = []
         self.briefs: list[ModeratorMessage] = []
@@ -234,6 +238,19 @@ class NegotiationSession:
                 if best is None or c < best[1]:
                     best = (p, c)
         return best
+
+    def decision_support(self) -> str:
+        """USD price and safety of every plan seen so far, for the Chief of Staff (no private raw data)."""
+        rows = []
+        for p in list(self.seen_plans.values())[-8:]:
+            r = check_all(self.s, p)
+            if is_safe(r):
+                items = sorted(cost_breakdown(self.s, p, r).items(), key=lambda kv: -kv[1])[:2]
+                rows.append(f"- {self._describe(p)}: SAFE, ${cost(self.s, p, r):,.0f} "
+                            f"(largest: {', '.join(f'{k} ${v:,.0f}' for k, v in items if v)})")
+            else:
+                rows.append(f"- {self._describe(p)}: UNSAFE ({'; '.join(c.name for x in r.values() for c in x.violations())})")
+        return "\n".join(rows)
 
     def _describe(self, p: Proposal) -> str:
         return f"TLDT {self.s.clock(p.landing_slot_min)} (slot {p.landing_slot_min}), RWY {p.runway}, stand {p.gate}"
@@ -332,7 +349,7 @@ class NegotiationSession:
             status=status, plan_source=source, turns_used=turns, proposal=proposal, reports=reports, cost=final_cost,
             reference=self.reference, reason=reason, messages=self.messages, briefs=self.briefs,
             decisions=self.decisions, alarms=self.alarms, metrics=self.metrics, usage=summarise(self.metrics),
-            deadlock=self.deadlock, safety_overrides=self.safety_overrides, stale_replies=self.stale_replies,
+            deadlock=self.deadlock, deadline_hit=self.deadline_hit, safety_overrides=self.safety_overrides, stale_replies=self.stale_replies,
             log_path=path, log_verified=self.log.verify(), elapsed_s=round(time.monotonic() - self.started, 1))
         return ("outcome", self.outcome)
 
@@ -390,6 +407,10 @@ class NegotiationSession:
             plan_id = 0
             last_countered: Optional[tuple] = None
             for turn in range(1, MAX_TURNS + 1):
+                if self._over_budget():
+                    yield self._alarm("TIME_BUDGET", "ALARM", "Negotiation time budget exceeded",
+                                      f"{time.monotonic() - self.started:.1f}s > {self.deadline_s:.0f}s budget", turn)
+                    raise _Stop("keep_partial" if self.best_partial() else "fallback")
                 if turn > 1:
                     yield from self._moderate(turn - 1, opening=False)
                 yield ("turn", {"turn": turn})
@@ -509,6 +530,11 @@ class NegotiationSession:
             return (yield from self._stop(max(turn, 1), stop))
         return (yield from self._fallback(MAX_TURNS, f"No safe consensus within {MAX_TURNS} turns."))
 
+    def _over_budget(self) -> bool:
+        if self.deadline_s is not None and time.monotonic() - self.started > self.deadline_s:
+            self.deadline_hit = True
+        return self.deadline_hit
+
     def _risks(self, full: dict[Domain, DomainReport]) -> list[str]:
         pm, gm = full["PILOT"].metrics, full["GROUND"].metrics
         risks = []
@@ -530,7 +556,7 @@ class NegotiationSession:
             return
         yield ("thinking", {"agents": ["MODERATOR"], "turn": turn})
         try:
-            brief = mod.brief(self.s, turn, self._bus(turn + 1), opening)
+            brief = mod.brief(self.s, turn, self._bus(turn + 1), opening, support=self.decision_support())
         except AgentError as e:  # advisory role: never blocks the negotiation
             ev = self._metric(e.metric)
             if ev:
@@ -553,9 +579,9 @@ class NegotiationSession:
 
 def negotiate(s: Scenario, agents: dict[str, BaseAgent], on_event: Optional[Callable[[str, object], None]] = None,
               autonomy: Autonomy = Autonomy.AUTONOMOUS, decide: Optional[Callable[[DecisionRequest], str]] = None,
-              save_log: bool = True) -> Outcome:
+              save_log: bool = True, deadline_s: Optional[float] = None) -> Outcome:
     """Run a session to completion. `decide` answers decision requests (default: the safe default)."""
-    session = NegotiationSession(s, agents, autonomy, save_log)
+    session = NegotiationSession(s, agents, autonomy, save_log, deadline_s)
     kind, data = session.advance()
     while True:
         if on_event:

@@ -22,6 +22,33 @@ points.
   DMs are never shown to other agents.
 - The roster sidebar shows each agent as idle, working, or waiting for you. Chats are appended to `logs/chat_*.jsonl`.
 
+## Decision layer and emergencies
+- **Costs** (`costs.py`): soft trade-offs are priced in USD with sourced, editable weights: fuel $/kg, aircraft time,
+  missed connections, crew overtime, remote stand, and next-leg knock-on (delay $/min x the 0.76 propagation measured in
+  the EDA). Costs only **rank plans that already pass every hard check**; safety is never weighed against money. Each
+  result shows an itemised breakdown and a robustness score: the share of 300 random ±50% weight scenarios in which the
+  plan stays cheapest. The Chief of Staff gets this table during negotiation and has a `compare_plans` tool in chat.
+- **MAYDAY fast path** (`emergency.py`): a red button on both pages, or just type "MAYDAY…" to the Chief. The
+  negotiation is abandoned and a deterministic plan is issued in under a millisecond: the earliest feasible landing
+  with zero added holding (never "offset 0", which can be physically impossible), conflicting traffic re-sequenced,
+  the right stand and services (remote stand with fire & rescue for technical failures, paramedics at the nearest gate
+  for medical), and parallel checklists for ATC, Flight Crew and AOCC. If no runway is usable, the aircraft diverts.
+  Agents only read back their actions; the plan never waits for them. Each emergency is logged under
+  `logs/EMERGENCY_*.jsonl`.
+
+## Real-world stress tests (`stress.py`, Control room → 🔥 Stress tests)
+Each case replays a documented failure mode against the live engine and checks: no crash · never an unsafe agreed
+plan · ≤ 3 turns · inside the time budget · log intact.
+| Case | Real-world basis | What must happen |
+|---|---|---|
+| NATS_RECORD | UK NATS Aug 2023: two beacons with one name crashed primary and identical backup | bad/ambiguous records quarantined, rest of batch continues; fallback is independent code |
+| LIGHTNING_RAMP | HKIA stops ramp work within 1 km; Changi suspends baggage handling | no contact stand before the ramp reopens |
+| RADAR_OUTAGE | PHL TRACON/Newark 2025, ~90 s radar+radio loss | all agents down → independent planner + alarm |
+| STAFFING_SHORTAGE | US ~3,500 controllers short (2025) | single runway, extra spacing, flaky agents, 20 s hard budget |
+| RUNWAY_CLOSURE | disabled aircraft | closed runway never used |
+| ROGUE_AGENTS | safety drill | unsafe ACCEPT overridden |
+| STORM_FRONT_WAVE | arrivals compressed into remaining capacity | parallel negotiations on a stale snapshot; lock-protected ledger re-validates, re-plans, fuel priority; no wake conflict, no double-booked stand |
+
 ## Data
 - `eda.py` produces `eda/EDA_REPORT.md` and `eda/calibration.json` (taxi-in, arrival rates, turnaround). Key findings: the file
   is pre-filtered, all rows already meet the rule, October is missing, 88% of rows are late-aircraft only, and inbound delay

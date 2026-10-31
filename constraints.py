@@ -10,6 +10,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel
 
+import costs
 from scenario import (
     IMC_EXTRA_SPACING_MIN, MAX_CREW_OVERTIME_MIN, MIN_CONNECT_TIME_MIN, MIN_FUEL_ADVISORY_MARGIN_MIN,
     SEVERE_HOLD_LIMIT_MIN, WAKE_SEPARATION_MIN, Scenario,
@@ -176,20 +177,30 @@ def is_safe(reports: dict[Domain, DomainReport]) -> bool:
     return all(r.hard_ok for r in reports.values())
 
 
-def cost(s: Scenario, p: Proposal, reports: Optional[dict[Domain, DomainReport]] = None) -> float:
+def cost_breakdown(s: Scenario, p: Proposal, reports: Optional[dict[Domain, DomainReport]] = None) -> dict[str, float]:
+    """Itemised USD cost (costs.py). Only meaningful for plans that pass every hard check."""
     r = reports or check_all(s, p)
-    pm, gm = r["PILOT"].metrics, r["GROUND"].metrics
     gate = s.gate(p.gate)
-    hold_rough = pm.get("holding_min", 0) if "MOD" in (pm.get("hold_turbulence"), pm.get("hold_icing")) else 0
-    return round(
-        pm.get("holding_fuel_kg", 0) * 0.05
-        + pm.get("missed_connection_pax", 0) * 2.0
-        + hold_rough * 0.5
-        + gm.get("crew_overtime_min", 0) * 1.5
-        + gm.get("next_leg_delay_min", 0) * 1.0
-        + (25 if gate and gate.remote else 0)
-        + r["ATC"].metrics.get("runway_movements_within_15min", 0) * 0.5,
-        2)
+    return costs.breakdown(r["PILOT"].metrics, r["GROUND"].metrics, r["ATC"].metrics, bool(gate and gate.remote))
+
+
+def cost(s: Scenario, p: Proposal, reports: Optional[dict[Domain, DomainReport]] = None) -> float:
+    """Total USD cost of the soft trade-offs (lexicographic: rank safe plans only)."""
+    return round(sum(cost_breakdown(s, p, reports).values()), 2)
+
+
+def plan_robustness(s: Scenario, chosen: Proposal, others: list[Proposal]) -> float:
+    """How often `chosen` stays cheapest among safe options when every weight is varied +/-50%."""
+    opts = {}
+    for p in [chosen, *others]:
+        r = check_all(s, p)
+        if is_safe(r):
+            gate = s.gate(p.gate)
+            opts[str((p.landing_slot_min, p.runway, p.gate))] = {
+                "pilot": r["PILOT"].metrics, "ground": r["GROUND"].metrics, "atc": r["ATC"].metrics,
+                "remote": bool(gate and gate.remote)}
+    key = str((chosen.landing_slot_min, chosen.runway, chosen.gate))
+    return costs.robustness(opts, key) if key in opts else 0.0
 
 
 # ============================================================================

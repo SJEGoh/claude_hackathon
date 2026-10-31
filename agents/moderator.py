@@ -49,8 +49,11 @@ class ModeratorAgent(BaseAgent):
             "have NO operational authority and NO private data: only the public disruption facts and the "
             "public bus. Make them converge safely inside the turn limit: name each conflict precisely, and "
             "when the published constraints allow it, propose one bridge plan that satisfies every HARD "
-            "constraint any specialist has published. Never relax or argue against a hard constraint. Be "
-            "terse: summary at most two sentences, one sentence per directive.")
+            "constraint any specialist has published. Never relax or argue against a hard constraint. Use the "
+            "decision-support table: it prices every plan seen so far in USD (fuel, delay, missed connections, "
+            "overtime, knock-on) and marks which pass every hard check; never bridge to a plan marked UNSAFE, and "
+            "among safe plans prefer the cheapest unless a specialist has published a reason the table cannot see. "
+            "Be terse: summary at most two sentences, one sentence per directive.")
 
     def public_brief(self, s: Scenario) -> str:
         return (f"Flight {s.flight} ({s.airline}, tail {s.tail_number}, {s.aircraft_type}) {s.origin}-{s.destination} "
@@ -58,7 +61,7 @@ class ModeratorAgent(BaseAgent):
                 f"{s.weather_delay_min} min, LATE_AIRCRAFT_DELAY {s.late_aircraft_delay_min} min. "
                 f"Weather: {s.weather_attribution} Runways in use: {', '.join(r.id for r in s.runways)}.")
 
-    def brief(self, s: Scenario, turn: int, bus: str, opening: bool) -> ModeratorMessage:
+    def brief(self, s: Scenario, turn: int, bus: str, opening: bool, support: str = "") -> ModeratorMessage:
         task = ("Open the call: summarise the disruption and tell each specialist what to publish first so the "
                 "call can close in as few turns as possible. bridge_proposal must be null."
                 if opening else
@@ -66,7 +69,8 @@ class ModeratorAgent(BaseAgent):
                 "takes over. Summarise, list open conflicts, propose a bridge plan if the published constraints "
                 "allow one, and give each specialist a directive for the next turn.")
         content = (f"## Public disruption facts\n{self.public_brief(s)}\n\n## Public bus\n{bus or '(empty)'}"
-                   f"\n\n## Task\n{task}")
+                   + (f"\n\n## Decision support (deterministic)\n{support}" if support else "")
+                   + f"\n\n## Task\n{task}")
         reply, metric = self._call(content, _moderator_schema(s), turn, system=f"{self.role}\n\n{SAFETY_CHARTER}")
         data = reply.model_dump()
         return ModeratorMessage(**data, turn=turn, metric=metric)

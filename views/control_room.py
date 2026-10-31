@@ -15,8 +15,11 @@ from agents.pilot_agent import PilotAgent
 from escalation import duty_phone
 from monitoring import summarise
 from negotiation import MAX_TURNS, Autonomy, NegotiationSession
+import costs
+from emergency import KIND_LABEL, plan_emergency
+from escalation import Alarm, dispatch
 from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, flights, get_scenario, hero, make_engine_agents,
-                       render_event, render_outcome, timeline)
+                       render_emergency, render_event, render_outcome, timeline)
 
 AUTONOMY_HELP = {
     "AUTONOMOUS": "Never pauses. Every decision point takes its safe default; alarms still go out.",
@@ -58,6 +61,19 @@ with st.sidebar:
         os.environ["DUTY_MANAGER_PHONE"], os.environ["ESCALATION_WEBHOOK_URL"] = phone, hook
         sound = st.toggle("Audible alarm", value=True)
 
+    with st.expander("💲 Cost weights (USD)"):
+        st.caption("Used ONLY to rank plans that already pass every hard check. Defaults and sources: costs.py.")
+        w = costs.weights()
+        new = {k: st.number_input(k.replace("_", " "), value=float(v), min_value=0.0, key=f"w_{k}")
+               for k, v in w.model_dump().items()}
+        c1, c2 = st.columns(2)
+        if c1.button("Save weights"):
+            costs.save_weights(costs.Weights(**new))
+            st.rerun()
+        if c2.button("Defaults"):
+            costs.save_weights(costs.Weights())
+            st.rerun()
+
     st.header("Disruption (US DOT 2015)")
     df = flights()
     c1, c2 = st.columns(2)
@@ -76,14 +92,15 @@ s = get_scenario(pick, weather_mode)
 scen_key = (pick, weather_mode)
 if st.session_state.get("cr_scen_key") != scen_key:
     st.session_state.update(cr_scen_key=scen_key, sess=None, events=[], pending=None, outcome=None, choice=None,
-                            played=set())
+                            played=set(), cr_emergency=None)
 
 # ============================================================================
 # Header
 # ============================================================================
 hero(f"Control room · AUTONOMOUS SG 2026 · Challenge #2 · three independent specialists, a Chief of Staff, max "
      f"{MAX_TURNS} turns, deterministic safety engine, human oversight tiers", compact=True)
-fids_board(s, st.session_state.get("outcome"), running=st.session_state.get("sess") is not None,
+fids_board(s, st.session_state.get("outcome"), emergency=st.session_state.get("cr_emergency"),
+           running=st.session_state.get("sess") is not None,
            pending=st.session_state.get("pending") is not None)
 m = st.columns(6)
 m[0].metric("Flight", s.flight, f"{s.origin} → {s.destination}", delta_color="off")
@@ -94,8 +111,8 @@ m[4].metric("ELDT", s.clock(s.eta_min), f"slot {s.eta_min}", delta_color="off")
 m[5].metric("Latest safe TLDT", s.clock(s.latest_safe_landing), "FRF+ALTN", delta_color="off")
 (st.warning if s.weather_at_destination else st.info)(s.weather_attribution, icon="🌦️")
 
-tab_neg, tab_wx, tab_mon, tab_batch, tab_eda = st.tabs(
-    ["🛫 Negotiation", "🌦️ Weather & provenance", "📈 Monitoring", "🧪 Batch evaluation", "🔎 EDA"])
+tab_neg, tab_wx, tab_mon, tab_stress, tab_batch, tab_eda = st.tabs(
+    ["🛫 Negotiation", "🌦️ Weather & provenance", "📈 Monitoring", "🔥 Stress tests", "🧪 Batch evaluation", "🔎 EDA"])
 
 
 # ============================================================================
@@ -112,11 +129,24 @@ with tab_neg:
     chart.plotly_chart(timeline(s, out.proposal if out else None, (out.reference.proposal if out else None)),
                        width="stretch")
 
-    b1, b2, _ = st.columns([1, 1, 4])
+    b1, b2, b3, b4 = st.columns([1.2, 0.8, 1.2, 1.4])
     start = b1.button("▶ Start negotiation", type="primary", disabled=use_claude and not key_ok)
     if b2.button("↺ Reset"):
-        st.session_state.update(sess=None, events=[], pending=None, outcome=None, choice=None, played=set())
+        st.session_state.update(sess=None, events=[], pending=None, outcome=None, choice=None, played=set(),
+                                cr_emergency=None)
         st.rerun()
+    em_kind = b3.selectbox("Emergency", list(KIND_LABEL), format_func=KIND_LABEL.get, label_visibility="collapsed")
+    if b4.button("🚨 DECLARE MAYDAY", help="Abandon negotiation; deterministic emergency plan in milliseconds."):
+        plan = plan_emergency(s, em_kind)
+        dispatch(Alarm(code="MAYDAY", severity="ALARM", title=f"{KIND_LABEL[em_kind]} {s.flight}",
+                       detail=f"Divert {plan.divert_to}" if plan.divert_to else
+                       f"RWY {plan.proposal.runway} {plan.landing_clock}, stand {plan.proposal.gate}",
+                       flight=s.flight, turn=0))
+        st.session_state.update(sess=None, pending=None, cr_emergency=plan, cr_em_live=True)
+        st.rerun()
+    if st.session_state.get("cr_emergency") is not None:
+        render_emergency(s, st.session_state.cr_emergency, live=st.session_state.pop("cr_em_live", False),
+                         sound=sound)
 
     for k, d in st.session_state.events:
         render(k, d)
@@ -272,6 +302,38 @@ with tab_batch:
 # ============================================================================
 # EDA tab
 # ============================================================================
+with tab_stress:
+    import stress
+    st.markdown("Real-world ATM failure modes replayed against the live engine. Every case checks the same "
+                "invariants: **no crash · never an unsafe agreed plan · ≤ 3 turns · inside the time budget · log "
+                "hash chain intact**. Runs on rule-based agents (free, about 10 s).")
+    case_info = {
+        "NATS_RECORD": "UK NATS, Aug 2023: two different beacons sharing a name crashed the primary and the identical "
+                       "backup. Here: corrupt and ambiguous records are quarantined; the rest of the batch continues.",
+        "LIGHTNING_RAMP": "Lightning halts ramp work (HKIA: within 1 km; Changi suspends baggage handling). Aircraft "
+                          "land but cannot reach contact stands.",
+        "RADAR_OUTAGE": "PHL TRACON / Newark, Apr-May 2025: ~90 s radar and radio loss over a single feed. Here: every "
+                        "AI agent is unreachable; the independent planner must take over and alarm.",
+        "STAFFING_SHORTAGE": "US ATC ~3,500 controllers short (2025): single runway, extra spacing, slow and flaky "
+                             "responders, 20 s hard budget.",
+        "RUNWAY_CLOSURE": "A disabled aircraft closes the preferred runway for 45 minutes.",
+        "ROGUE_AGENTS": "Adversarial agents push a plan that breaks the fuel limit.",
+        "STORM_FRONT_WAVE": "Five real DOT arrivals at one hub negotiated in parallel on a stale snapshot, committed "
+                            "through a lock-protected ledger that re-validates every plan (stale-state race).",
+    }
+    picked = st.multiselect("Cases", list(case_info), default=list(case_info))
+    if st.button("▶ Run stress suite", type="primary"):
+        with st.spinner("Running stress cases…"):
+            st.session_state.stress = stress.run_suite(row=int(pick) if int(pick) < 190 else 40,
+                                                       weather_mode="OFF", cases=picked)
+    for r in st.session_state.get("stress", []):
+        icon = "✅" if r.passed else "❌"
+        with st.expander(f"{icon} **{r.case}** · {r.title} · {r.status} · {r.elapsed_s}s", expanded=not r.passed):
+            st.caption(case_info.get(r.case, r.basis) + (f" [source]({r.source})" if r.source else ""))
+            st.dataframe(pd.DataFrame([i.model_dump() for i in r.invariants]), hide_index=True, width="stretch")
+            for n in r.notes:
+                st.caption(n)
+
 with tab_eda:
     report = ROOT / "eda" / "EDA_REPORT.md"
     if not report.exists():

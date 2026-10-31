@@ -18,9 +18,12 @@ from agents.base import SAFETY_CHARTER
 from agents.chief import CHIEF_SYSTEM, CHIEF_TOOLS
 from agents.conversation import CHAT_STYLE, Conversation, converse, specialist_tools
 from monitoring import summarise
-from negotiation import Autonomy, NegotiationSession
+from constraints import Proposal, check_all, cost, cost_breakdown, is_safe
+from emergency import KIND_LABEL, plan_emergency, readbacks
+from escalation import Alarm, dispatch
+from negotiation import Autonomy, ConsensusLog, NegotiationSession
 from scenario import load_disrupted_flights
-from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, get_scenario, hero, make_engine_agents,
+from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, get_scenario, hero, make_engine_agents, render_emergency,
                        render_event, render_outcome, timeline)
 
 CHANNELS = ["group", "MODERATOR", "ATC", "PILOT", "GROUND"]
@@ -44,6 +47,8 @@ S.setdefault("oc_outcome", None)
 S.setdefault("oc_metrics", [])
 S.setdefault("oc_click", None)
 S.setdefault("oc_channel", "group")
+S.setdefault("oc_emergency", None)
+S.setdefault("oc_fire", None)
 
 # ============================================================================
 # Sidebar: roster + settings
@@ -69,6 +74,14 @@ with st.sidebar:
 
     for a in ROLES:
         show_status(a, S.oc_status[a])
+    st.divider()
+    st.markdown("**🚨 Emergency**")
+    st.selectbox("Emergency type", list(KIND_LABEL), format_func=KIND_LABEL.get, key="oc_em_kind",
+                 label_visibility="collapsed")
+    st.button("🚨 DECLARE MAYDAY", type="primary", width="stretch", disabled=S.oc_scenario is None,
+              help="Abandon negotiation; the deterministic emergency planner decides instantly and every desk "
+                   "gets its checklist at once.",
+              on_click=lambda: S.update(oc_fire=S.oc_em_kind, oc_channel="group"))
     st.divider()
     with st.expander("Settings", expanded=False):
         key_ok = len(os.environ.get("ANTHROPIC_API_KEY", "")) > 40
@@ -119,6 +132,9 @@ def draw(item: dict) -> None:
         item["live"] = False
     elif t == "outcome" and s is not None:
         render_outcome(s, item["data"])
+    elif t == "emergency" and s is not None:
+        render_emergency(s, item["data"], item.get("rb"), live=item.get("live", False), sound=sound)
+        item["live"] = False
     elif t == "note":
         st.caption(item["text"])
         if item.get("jump") and item["jump"] != channel:
@@ -287,7 +303,7 @@ def t_find_flights(destination_airport: str, bucket: str, min_weather_delay: int
 
 def t_load_flight(row_id: int, weather_mode: str) -> str:
     s = get_scenario(row_id, weather_mode)
-    S.oc_scenario, S.oc_session, S.oc_pending, S.oc_outcome = s, None, None, None
+    S.oc_scenario, S.oc_session, S.oc_pending, S.oc_outcome, S.oc_emergency = s, None, None, None, None
     post("group", {"t": "note", "text": f"📂 Active flight: **{s.flight}** {s.origin}→{s.destination} {s.date}, "
                                         f"SIBT {s.clock(0)} · WX {s.weather_delay_min} · LATE {s.late_aircraft_delay_min} "
                                         f"· weather {weather_mode.lower()}"},
@@ -390,7 +406,74 @@ def t_get_record() -> str:
     return "\n".join(lines[-80:]) or "No negotiation yet."
 
 
-CHIEF_IMPL = {"find_flights": t_find_flights, "load_flight": t_load_flight, "flight_status": t_flight_status,
+def t_compare_plans(plans: list) -> str:
+    s = scenario()
+    if s is None:
+        return "No flight loaded."
+    out = []
+    for raw in plans[:8]:
+        p = Proposal(**raw)
+        if s.runway(p.runway) is None or s.gate(p.gate) is None:
+            out.append({"plan": raw, "valid": False, "reason": "unknown runway or stand"})
+            continue
+        r = check_all(s, p)
+        row = {"plan": raw, "tldt": s.clock(p.landing_slot_min), "safe": is_safe(r)}
+        if row["safe"]:
+            row["usd_total"] = cost(s, p, r)
+            row["usd_items"] = {k: round(v) for k, v in cost_breakdown(s, p, r).items() if v}
+        else:
+            row["hard_violations"] = [f"{d}: {c.name}" for d, x in r.items() for c in x.violations()]
+        out.append(row)
+    return json.dumps(out)
+
+
+def fire_emergency(kind: str, reason: str = "", by: str = "duty officer") -> str:
+    """MAYDAY fast path: deterministic plan first (milliseconds), broadcast, then optional readbacks."""
+    s = scenario()
+    if s is None:
+        return "No flight loaded."
+    plan = plan_emergency(s, kind, reason)
+    if S.oc_session is not None and S.oc_outcome is None:
+        post("group", {"t": "note", "text": "⛔ Negotiation aborted: emergency declared."},
+             log_line="SYSTEM: negotiation aborted by emergency")
+    S.oc_session, S.oc_pending, S.oc_emergency = None, None, plan
+    alarm = dispatch(Alarm(code="MAYDAY", severity="ALARM", title=f"{KIND_LABEL[kind]} {s.flight}",
+                           detail=(f"Divert {plan.divert_to}" if plan.divert_to else
+                                   f"RWY {plan.proposal.runway} {plan.landing_clock}, stand {plan.proposal.gate}")
+                           + (f"; {reason}" if reason else ""), flight=s.flight, turn=0))
+    log = ConsensusLog()
+    log.add(0, by.upper().replace(" ", "_"), "emergency_declared", {"kind": kind, "reason": reason})
+    log.add(0, "SYSTEM", "emergency_plan", plan.model_dump())
+    log.add(0, "SYSTEM", "alarm", alarm.model_dump())
+    log.save(ROOT / "logs" / f"EMERGENCY_{s.flight}_{datetime.now():%Y%m%d-%H%M%S}.jsonl")
+    post("group", {"t": "emergency", "data": plan, "live": True},
+         log_line=f"EMERGENCY {kind} declared by {by}: " + (f"divert {plan.divert_to}" if plan.divert_to else
+                  f"RWY {plan.proposal.runway} {plan.landing_clock} stand {plan.proposal.gate}"))
+    for a in ("ATC", "PILOT", "GROUND"):
+        show_status(a, "working")
+        post(a, {"t": "msg", "who": a, "text": f"🚨 **{KIND_LABEL[kind]} {s.flight}**. My actions:\n- "
+                 + "\n- ".join(plan.actions[a])})
+    if engine == ENGINES[0]:  # readbacks never delay the plan: it is already on everyone's screen
+        with st.spinner("Desks reading back…"):
+            rb = readbacks(plan, make_engine_agents(engine, model, effort))
+        for a, text in rb.items():
+            if text:
+                post("group", {"t": "msg", "who": a, "text": f"📻 {text}", "meta": "readback"},
+                     log_line=f"{a} readback: {text}")
+    for a in ("ATC", "PILOT", "GROUND"):
+        show_status(a, "idle")
+    return (f"Emergency plan issued in {plan.decision_ms:.2f} ms: "
+            + (f"divert to {plan.divert_to}" if plan.divert_to else
+               f"RWY {plan.proposal.runway} at {plan.landing_clock}, stand {plan.proposal.gate}, {plan.fuel_status}")
+            + f"; displaced traffic: {', '.join(plan.displaced) or 'none'}; alarm via {', '.join(alarm.channels)}.")
+
+
+def t_declare_emergency(kind: str, reason: str) -> str:
+    return fire_emergency(kind, reason, by="Chief of Staff")
+
+
+CHIEF_IMPL = {"compare_plans": t_compare_plans, "declare_emergency": t_declare_emergency,
+              "find_flights": t_find_flights, "load_flight": t_load_flight, "flight_status": t_flight_status,
               "start_negotiation": t_start_negotiation, "resolve_decision": t_resolve_decision,
               "ask_specialist": t_ask_specialist, "get_negotiation_record": t_get_record}
 
@@ -401,7 +484,7 @@ s = scenario()
 hero("Ops chat · talk to your AI operations team. Group chat in #ops-team, private DMs with each agent.",
      compact=True)
 if s is not None:
-    fids_board(s, S.oc_outcome, running=S.oc_session is not None and S.oc_outcome is None,
+    fids_board(s, S.oc_outcome, emergency=S.oc_emergency, running=S.oc_session is not None and S.oc_outcome is None,
                pending=S.oc_pending is not None)
 if channel == "group":
     st.subheader("👥 #ops-team")
@@ -452,6 +535,13 @@ if S.oc_click is not None and req is not None:
     post("group", {"t": "msg", "who": "user", "text": f"Decision: **{label}**"}, log_line=f"DUTY OFFICER DECISION: {label}")
     S.oc_pending = None
     pump(choice)
+    st.rerun()
+
+if S.oc_fire is not None:
+    kind, S.oc_fire = S.oc_fire, None
+    post("group", {"t": "msg", "who": "user", "text": f"🚨 **MAYDAY**: {KIND_LABEL[kind]} declared"},
+         log_line=f"DUTY OFFICER: MAYDAY {kind}")
+    fire_emergency(kind)
     st.rerun()
 
 placeholder = ("Message the team… (@ATC, @Pilot, @Ground to address someone)" if channel == "group"

@@ -10,6 +10,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import profiles
+from constraints import Proposal, cost_breakdown, plan_robustness
+from emergency import KIND_LABEL, EmergencyPlan
 from escalation import duty_phone
 from negotiation import MAX_TURNS
 from scenario import Scenario, build_scenario, load_disrupted_flights, split_of
@@ -64,6 +66,7 @@ h1, h2, h3 { letter-spacing: -0.02em; font-weight: 800 !important; }
 [data-testid="stChatMessageAvatarCustom"] img, [data-testid="stChatMessage"] img { image-rendering: pixelated; border-radius: 10px; }
 [data-testid="stExpander"] details, [data-testid="stVerticalBlockBorderWrapper"] { border-radius: 16px !important; border-color: #22272F !important; }
 .stButton button { border-radius: 999px; font-weight: 600; }
+[data-testid="stSidebar"] .stButton button[kind="primary"] { background: #E5322D; border-color: #E5322D; color: #fff; }
 video { image-rendering: pixelated; border-radius: 14px; border: 1px solid #22272F; }
 .runway { height: 6px; margin: 2px 0 14px 0; border-radius: 3px;
   background: repeating-linear-gradient(90deg, #C6F432 0 26px, transparent 26px 46px); opacity: .85; }
@@ -94,10 +97,13 @@ def hero(subtitle: str, compact: bool = False) -> None:
     st.markdown("<div class='runway'></div>", unsafe_allow_html=True)
 
 
-def fids_board(s: Scenario, outcome=None, running: bool = False, pending: bool = False) -> None:
+def fids_board(s: Scenario, outcome=None, running: bool = False, pending: bool = False, emergency=None) -> None:
     """Departure-board style status strip for the active flight."""
     p = outcome.proposal if outcome else None
-    if outcome is None:
+    if emergency is not None:
+        p = emergency.proposal or Proposal(landing_slot_min=s.eta_min, runway="DIVERT", gate=emergency.divert_to or "ALTN")
+        status, cls = f"{KIND_LABEL[emergency.kind]}", "bad busy"
+    elif outcome is None:
         status, cls = (("AWAITING OPS", "busy") if pending else ("NEGOTIATING", "busy") if running
                        else (f"DELAYED +{s.late_aircraft_delay_min + s.weather_delay_min}", ""))
     elif p.runway == "DIVERT":
@@ -230,13 +236,23 @@ def render_outcome(s: Scenario, out) -> None:
     c = st.columns(5)
     pm = out.reports["PILOT"].metrics if out.reports else {}
     gm = out.reports["GROUND"].metrics if out.reports else {}
-    c[0].metric("Plan cost", out.cost, None if out.cost is None or out.reference.cost is None
-                else f"{out.cost - out.reference.cost:+.1f} vs optimum", delta_color="inverse")
+    c[0].metric("Plan cost (USD)", f"${out.cost:,.0f}" if out.cost is not None else "–",
+                None if out.cost is None or out.reference.cost is None
+                else f"{out.cost - out.reference.cost:+,.0f} vs optimum", delta_color="inverse")
     c[1].metric("Holding / EFOB", f"{pm.get('holding_min', '–')} min", f"{pm.get('efob_kg', '–')} kg", delta_color="off")
     c[2].metric("Missed pax / overtime", f"{pm.get('missed_connection_pax', '–')} pax",
                 f"{gm.get('crew_overtime_min', '–')} min", delta_color="off")
     c[3].metric("API spend", f"${out.usage['cost_usd']:.3f}", f"{out.usage['calls']} calls", delta_color="off")
     c[4].metric("Elapsed", f"{out.elapsed_s}s", f"{len(out.alarms)} alarms", delta_color="off")
+    if out.reports and all(r.hard_ok for r in out.reports.values()):
+        with st.expander("💲 Why this plan: cost breakdown (only safe plans are ever priced)"):
+            items = {k: v for k, v in cost_breakdown(s, p, out.reports).items() if v}
+            st.dataframe(pd.DataFrame({"item": list(items), "USD": [round(v) for v in items.values()]}),
+                         hide_index=True, width="stretch")
+            others = [out.reference.proposal] + [a for a, _ in out.reference.alternatives]
+            rob = plan_robustness(s, p, [o for o in others if o != p])
+            st.caption(f"Robustness: this plan stays the cheapest safe option in **{rob:.0%}** of 300 scenarios "
+                       "where every weight is varied ±50%. Weights and sources: costs.py / Control room sidebar.")
     if out.log_path:
         st.download_button(f"Download consensus log (hash chain {'verified ✅' if out.log_verified else 'BROKEN ❌'})",
                            Path(out.log_path).read_text(), file_name=Path(out.log_path).name,
@@ -267,3 +283,36 @@ def timeline(s: Scenario, final=None, reference=None) -> go.Figure:
                       xaxis=dict(title="minutes relative to SIBT (red band = runway closed)",
                                  range=[s.eta_min - 20, max(s.latest_safe_landing, s.eta_min + 60) + 15]))
     return fig
+
+
+def render_emergency(s: Scenario, plan: EmergencyPlan, readbacks: dict | None = None, live: bool = False,
+                     sound: bool = True) -> None:
+    head = (f"🚨 **{KIND_LABEL[plan.kind]} · {plan.flight}**"
+            + (f" — {plan.reason}" if plan.reason else "")
+            + f"  \nDecided in **{plan.decision_ms:.2f} ms** by the deterministic emergency planner (no negotiation). ")
+    if plan.divert_to:
+        st.error(head + f"  \n**DIVERT to {plan.divert_to}**: no usable runway before fuel runs out.")
+    else:
+        p = plan.proposal
+        st.error(head + f"  \nPriority landing **RWY {p.runway} at {plan.landing_clock}** (no holding) · stand "
+                 f"**{p.gate}** in-block {plan.in_block_clock} · EFOB {plan.efob_kg} kg ({plan.fuel_status})")
+    if live:
+        st.toast(f"🚨 {KIND_LABEL[plan.kind]} {plan.flight}", icon="🚨")
+        if sound:
+            st.audio(beep(), format="audio/wav", autoplay=True)
+    cols = st.columns(3)
+    for col, key in zip(cols, ("ATC", "PILOT", "GROUND")):
+        with col.container(border=True):
+            av = AVATARS[key]
+            h1, h2 = st.columns([1, 4], vertical_alignment="center")
+            if str(av).endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                h1.image(av, width=36)
+            else:
+                h1.markdown(f"<div style='font-size:26px'>{av}</div>", unsafe_allow_html=True)
+            h2.markdown(f"**{NAMES[key]}**")
+            for a in plan.actions[key]:
+                st.markdown(f"- {a}")
+            if readbacks and readbacks.get(key):
+                st.caption(f"📻 Readback: {readbacks[key]}")
+    if duty_phone():
+        st.link_button(f"📞 Call duty manager {duty_phone()}", f"tel:{duty_phone()}")

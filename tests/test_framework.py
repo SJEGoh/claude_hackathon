@@ -207,6 +207,64 @@ class TestNegotiation(unittest.TestCase):
         self.assertTrue(out.status != "CONSENSUS" or is_safe(check_all(self.s, out.proposal)))
 
 
+class TestEmergencyAndCosts(unittest.TestCase):
+    def setUp(self):
+        from emergency import plan_emergency
+        self.plan, self.s = plan_emergency, scenario()
+
+    def test_emergency_is_fast_and_lands_at_earliest_feasible_slot(self):
+        s = self.s
+        for kind in ("FUEL", "MEDICAL", "TECHNICAL"):
+            plan = self.plan(s, kind)
+            self.assertLess(plan.decision_ms, 200)
+            rwy = s.runway(plan.proposal.runway)
+            self.assertTrue(rwy.wind_within_limits)
+            earliest = min(max(r.closed_until, s.eta_min) for r in s.runways if r.wind_within_limits)
+            if kind != "TECHNICAL":  # zero added holding: no slot later than the earliest feasible one
+                self.assertEqual(plan.proposal.landing_slot_min, earliest)
+            self.assertGreaterEqual(plan.proposal.landing_slot_min, max(rwy.closed_until, s.eta_min))
+            self.assertTrue(all(plan.actions[d] for d in ("ATC", "PILOT", "GROUND")))
+
+    def test_technical_goes_to_remote_stand_with_fire_and_rescue(self):
+        plan = self.plan(self.s, "TECHNICAL")
+        self.assertEqual(plan.proposal.gate, "R1")
+        self.assertIn("ARFF", plan.actions["GROUND"][0])
+
+    def test_emergency_diverts_when_no_runway_is_usable(self):
+        s = self.s.model_copy(deep=True)
+        for r in s.runways:
+            r.wind_within_limits = False
+        plan = self.plan(s, "FUEL")
+        self.assertEqual(plan.divert_to, s.alternate)
+        self.assertIsNone(plan.proposal)
+
+    def test_costs_rank_only_safe_plans_and_are_itemised(self):
+        from constraints import cost_breakdown, plan_robustness
+        ref = deterministic_plan(self.s)
+        items = cost_breakdown(self.s, ref.proposal)
+        self.assertAlmostEqual(sum(items.values()), ref.cost, places=1)
+        self.assertGreaterEqual(plan_robustness(self.s, ref.proposal, [p for p, _ in ref.alternatives]), 0.0)
+        unsafe = Proposal(landing_slot_min=self.s.latest_safe_landing + 30, runway=self.s.runways[0].id, gate="R1")
+        self.assertEqual(plan_robustness(self.s, unsafe, [ref.proposal]), 0.0)
+
+
+class TestStressSuite(unittest.TestCase):
+    def test_all_real_world_stress_cases_hold_the_invariants(self):
+        import stress
+        results = stress.run_suite(weather_mode="OFF")
+        failed = {r.case: [i.name for i in r.invariants if not i.passed] for r in results if not r.passed}
+        self.assertEqual(failed, {})
+        self.assertEqual(len(results), 7)
+
+    def test_time_budget_forces_a_decision(self):
+        import stress
+        s = scenario()
+        slow = {k: stress.FlakyAgent(a, (0.6, 0.6)) for k, a in make_rule_agents().items()}
+        out = negotiate(s, slow, save_log=False, deadline_s=1.0)
+        self.assertTrue(out.deadline_hit)
+        self.assertIn("TIME_BUDGET", [a.code for a in out.alarms])
+
+
 class TestEscalationAndLog(unittest.TestCase):
     def test_webhook_called(self):
         with mock.patch.dict("os.environ", {"ESCALATION_WEBHOOK_URL": "https://example.invalid/hook"}), \

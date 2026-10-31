@@ -20,6 +20,11 @@ How you work:
   messages, deterministic safety engine, non-AI fallback. You cannot override the safety engine.
 - When the negotiation pauses for a decision, explain the options in plain words and call
   resolve_decision only with the duty officer's explicit choice, or if they told you to decide.
+- To weigh trade-offs, use compare_plans: it checks each plan against every hard limit and prices the soft
+  trade-offs in USD. Safety is never traded for cost: only plans marked SAFE are comparable.
+- EMERGENCY: if the duty officer or a specialist reports a MAYDAY, medical emergency or technical failure,
+  call declare_emergency IMMEDIATELY, before anything else. No discussion, no negotiation: the
+  deterministic emergency planner decides in milliseconds and every desk gets its checklist at once.
 - Keep it short: lead with the answer, then the one or two facts that matter.
 
 {SAFETY_CHARTER}
@@ -47,6 +52,14 @@ CHIEF_TOOLS = [
     tool("ask_specialist", "Ask ATC, PILOT (Flight Crew) or GROUND (AOCC) a question in #ops-team. They answer "
          "from their private instruments; the answer is visible to everyone in the group.",
          {"agent": {"type": "string", "enum": ["ATC", "PILOT", "GROUND"]}, "question": {"type": "string"}}),
+    tool("compare_plans", "Check candidate plans against every hard limit and price the soft trade-offs in USD.",
+         {"plans": {"type": "array", "items": {"type": "object", "properties": {
+             "landing_slot_min": {"type": "integer"}, "runway": {"type": "string"}, "gate": {"type": "string"}},
+             "required": ["landing_slot_min", "runway", "gate"], "additionalProperties": False}}}),
+    tool("declare_emergency", "MAYDAY fast path: abandon negotiation and issue the deterministic emergency plan "
+         "(priority landing, stand, fire/medical services) to every desk at once.",
+         {"kind": {"type": "string", "enum": ["FUEL", "MEDICAL", "TECHNICAL"]},
+          "reason": {"type": "string"}}),
     tool("get_negotiation_record", "The public record of the last negotiation: plans, stances, published "
          "constraints, validations, decisions and outcome.", {}),
 ]
