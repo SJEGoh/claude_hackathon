@@ -19,6 +19,7 @@ import costs
 from emergency import KIND_LABEL, plan_emergency
 from escalation import Alarm, dispatch
 from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, flights, get_scenario, hero, make_engine_agents,
+                       weather_card,
                        ratification_form, render_emergency, render_event, render_outcome, timeline)
 
 AUTONOMY_HELP = {
@@ -99,9 +100,7 @@ if st.session_state.get("cr_scen_key") != scen_key:
 # ============================================================================
 # Header
 # ============================================================================
-hero(f"Control room · AUTONOMOUS SG 2026 · Challenge #2 · three independent specialists, a Chief of Staff, max "
-     f"{MAX_TURNS} turns per round, stakeholder ratification, deterministic safety engine, human oversight tiers",
-     compact=True)
+hero(compact=True)
 fids_board(s, st.session_state.get("outcome"), emergency=st.session_state.get("cr_emergency"),
            running=st.session_state.get("sess") is not None,
            pending=st.session_state.get("pending") is not None or st.session_state.get("ratify") is not None)
@@ -112,10 +111,10 @@ m[2].metric("WEATHER_DELAY", f"{s.weather_delay_min} min")
 m[3].metric("LATE_AIRCRAFT", f"{s.late_aircraft_delay_min} min")
 m[4].metric("ELDT", s.clock(s.eta_min), f"slot {s.eta_min}", delta_color="off")
 m[5].metric("Latest safe TLDT", s.clock(s.latest_safe_landing), "FRF+ALTN+cont.", delta_color="off")
-(st.warning if s.weather_at_destination else st.info)(s.weather_attribution, icon="🌦️")
+weather_card(s)
 
-tab_neg, tab_wx, tab_mon, tab_stress, tab_batch, tab_eda = st.tabs(
-    ["🛫 Negotiation", "🌦️ Weather & provenance", "📈 Monitoring", "🔥 Stress tests", "🧪 Batch evaluation", "🔎 EDA"])
+# Stress tests, batch evaluation and EDA stay available from the command line (stress.py, batch_eval.py, eda.py).
+tab_neg, tab_wx, tab_mon = st.tabs(["🛫 Negotiation", "🌦️ Weather & provenance", "📈 Monitoring"])
 
 
 # ============================================================================
@@ -132,16 +131,16 @@ with tab_neg:
     chart.plotly_chart(timeline(s, out.proposal if out else None, (out.reference.proposal if out else None)),
                        width="stretch")
 
-    b1, b2, b3, b4 = st.columns([1.2, 0.8, 1.2, 1.4])
+    b1, b2, _ = st.columns([1.2, 0.8, 4])
     start = b1.button("▶ Start negotiation", type="primary", disabled=use_claude and not key_ok)
     if b2.button("↺ Reset"):
         st.session_state.update(sess=None, events=[], pending=None, ratify=None, outcome=None, choice=None, played=set(),
                                 cr_emergency=None)
         st.rerun()
-    em_kind = b3.selectbox("Emergency", list(KIND_LABEL), format_func=KIND_LABEL.get, label_visibility="collapsed")
-    if b4.button("🚨 DECLARE MAYDAY", help="Abandon negotiation; deterministic emergency plan in milliseconds."):
-        plan = plan_emergency(s, em_kind)
-        dispatch(Alarm(code="MAYDAY", severity="ALARM", title=f"{KIND_LABEL[em_kind]} {s.flight}",
+    req_m = st.session_state.pop("mayday_request", None)  # from the sidebar's confirmed MAYDAY
+    if req_m:
+        plan = plan_emergency(s, req_m["kind"], req_m["reason"])
+        dispatch(Alarm(code="MAYDAY", severity="ALARM", title=f"{KIND_LABEL[req_m['kind']]} {s.flight}",
                        detail=f"Divert {plan.divert_to}" if plan.divert_to else
                        f"RWY {plan.proposal.runway} {plan.landing_clock}, stand {plan.proposal.gate}",
                        flight=s.flight, turn=0))
@@ -273,10 +272,18 @@ with tab_wx:
 # Monitoring tab
 # ============================================================================
 with tab_mon:
-    sess = st.session_state.sess
-    metrics = sess.metrics if sess else []
+    sources = {
+        "CONTROLS negotiation": st.session_state.sess.metrics if st.session_state.get("sess") else [],
+        "CHATS negotiation": st.session_state.oc_session.metrics if st.session_state.get("oc_session") else [],
+        "CHATS conversations": st.session_state.get("oc_metrics", []),
+    }
+    available = [k for k, v in sources.items() if v]
+    picked_src = st.segmented_control("Source", ["All", *sources], default="All", key="mon_src")
+    metrics = [m for k, v in sources.items() for m in v] if picked_src in (None, "All") else sources[picked_src]
+    st.caption("Calls recorded this session: " + (", ".join(f"{k} {len(sources[k])}" for k in available) or "none yet"))
     if not metrics:
-        st.info("Run a negotiation with Claude agents to see per-call telemetry.")
+        st.info("No Claude calls recorded yet. Chat with the agents in CHATS or start a negotiation with Claude agents; "
+                "deterministic runs make no API calls, so they show nothing here.")
     else:
         u = summarise(metrics)
         c = st.columns(5)
@@ -286,75 +293,10 @@ with tab_mon:
         c[3].metric("Cost", f"${u['cost_usd']:.4f}")
         c[4].metric("Latency p50 / max", f"{u['latency_p50_s']}s", f"max {u['latency_max_s']}s", delta_color="off")
         mdf = pd.DataFrame([x.model_dump() for x in metrics])
-        fig = go.Figure(go.Bar(x=[f"T{t} {a}" for t, a in zip(mdf.turn, mdf.agent)], y=mdf.latency_s,
+        fig = go.Figure(go.Bar(x=[f"#{i + 1} {a}" for i, a in enumerate(mdf.agent)], y=mdf.latency_s,
                                marker_color=["#d62728" if not ok else "#4c78a8" for ok in mdf.ok]))
         fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10), title="Latency per call (s)")
         st.plotly_chart(fig, width="stretch")
         st.dataframe(mdf, hide_index=True, width="stretch")
         st.caption("Pricing table in monitoring.py. Output tokens include adaptive-thinking tokens, which are billed "
                    "as output. Agents see a compact bus (constraint ledger + latest turn), not the full transcript.")
-
-# ============================================================================
-# Batch evaluation tab
-# ============================================================================
-with tab_batch:
-    st.markdown("Stratified by disruption bucket, split 80/20 dev/test by a stable hash. Tune prompts on **dev**, "
-                "report on **test**.")
-    st.code("python batch_eval.py --agents rules --n 5          # free baseline\n"
-            "python batch_eval.py --split test --n 4 --workers 3 # Claude agents (~$0.2-0.5 per flight)", language="bash")
-    reports = sorted((ROOT / "eval").glob("*.md"), reverse=True)
-    if reports:
-        chosen = st.selectbox("Saved runs", reports, format_func=lambda p: p.stem)
-        st.markdown(chosen.read_text())
-        csv = chosen.with_suffix(".csv")
-        if csv.exists():
-            st.dataframe(pd.read_csv(csv), hide_index=True, width="stretch")
-    else:
-        st.info("No batch runs yet.")
-
-# ============================================================================
-# EDA tab
-# ============================================================================
-with tab_stress:
-    import stress
-    st.markdown("Real-world ATM failure modes replayed against the live engine. Every case checks the same "
-                "invariants: **no crash · never an unsafe agreed plan · ≤ 3 turns · inside the time budget · log "
-                "hash chain intact**. Runs on rule-based agents (free, about 10 s).")
-    case_info = {
-        "NATS_RECORD": "UK NATS, Aug 2023: two different beacons sharing a name crashed the primary and the identical "
-                       "backup. Here: corrupt and ambiguous records are quarantined; the rest of the batch continues.",
-        "LIGHTNING_RAMP": "Lightning halts ramp work (HKIA: within 1 km; Changi suspends baggage handling). Aircraft "
-                          "land but cannot reach contact stands.",
-        "RADAR_OUTAGE": "PHL TRACON / Newark, Apr-May 2025: ~90 s radar and radio loss over a single feed. Here: every "
-                        "AI agent is unreachable; the independent planner must take over and alarm.",
-        "STAFFING_SHORTAGE": "US ATC ~3,500 controllers short (2025): single runway, extra spacing, slow and flaky "
-                             "responders, 20 s hard budget.",
-        "RUNWAY_CLOSURE": "A disabled aircraft closes the preferred runway for 45 minutes.",
-        "ROGUE_AGENTS": "Adversarial agents push a plan that breaks the fuel limit.",
-        "STORM_FRONT_WAVE": "Five real DOT arrivals at one hub negotiated in parallel on a stale snapshot, committed "
-                            "through a lock-protected ledger that re-validates every plan (stale-state race).",
-    }
-    picked = st.multiselect("Cases", list(case_info), default=list(case_info))
-    if st.button("▶ Run stress suite", type="primary"):
-        with st.spinner("Running stress cases…"):
-            st.session_state.stress = stress.run_suite(row=int(pick) if int(pick) < 190 else 40,
-                                                       weather_mode="OFF", cases=picked)
-    for r in st.session_state.get("stress", []):
-        icon = "✅" if r.passed else "❌"
-        with st.expander(f"{icon} **{r.case}** · {r.title} · {r.status} · {r.elapsed_s}s", expanded=not r.passed):
-            st.caption(case_info.get(r.case, r.basis) + (f" [source]({r.source})" if r.source else ""))
-            st.dataframe(pd.DataFrame([i.model_dump() for i in r.invariants]), hide_index=True, width="stretch")
-            for n in r.notes:
-                st.caption(n)
-
-with tab_eda:
-    report = ROOT / "eda" / "EDA_REPORT.md"
-    if not report.exists():
-        st.info("Run `python eda.py` first.")
-    else:
-        for chunk in re.split(r"(!\[[^\]]*\]\([^)]+\))", report.read_text()):
-            img = re.match(r"!\[([^\]]*)\]\(([^)]+)\)", chunk)
-            if img:
-                st.image(str(ROOT / "eda" / img.group(2)), caption=img.group(1))
-            elif chunk.strip():
-                st.markdown(chunk)

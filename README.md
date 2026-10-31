@@ -84,6 +84,16 @@ summarised reasoning, `thinking.display: "summarized"`), pending decisions, alar
 `docs/REACT_DASHBOARD_PROMPT.md` is a ready-to-paste prompt that makes Claude build an Apple-style React dashboard
 against this exact contract.
 
+## Guided demo and voice
+- **Ops settings → 🎬 Start guided demo** walks through every feature on one real DOT row: **UA1112, Dulles → Denver,
+  6 May 2015** (row 115187; WEATHER_DELAY 37, LATE_AIRCRAFT_DELAY 26; real KDEN thunderstorm with lightning, MOD
+  turbulence PIREP, runways closed, stand conflict, tight fuel). The steps are: meet the team · brief the Chief with the
+  DOT row · cross-domain handoff · bounded negotiation with stakeholder votes · rogue agents blocked · AI outage
+  fallback · weather alert and notifications · MAYDAY · log. Run it with live Claude agents (about $1-2) or
+  deterministic (free).
+- **Voice:** in CHATS click 🎙️ Enable voice, allow the microphone, and speak. Speech is transcribed locally with Whisper
+  (faster-whisper, offline). Starting with an agent's name ("ATC…", "Captain…") works like an @mention.
+
 ## Data
 - `data/flights.csv` is the US DOT 2015 extract. Each scenario starts from one of its rows.
 - `data/challenge2_operational_constraints.xlsx` is the organisers' limits workbook, loaded by `limits.py`. Its airport

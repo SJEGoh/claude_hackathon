@@ -18,7 +18,7 @@ from scenario import Scenario, build_scenario, load_disrupted_flights, split_of
 
 ROOT = Path(__file__).parent
 STANCE = {"PROPOSE": "blue", "ACCEPT": "green", "COUNTER": "orange"}
-ENGINES = ["Claude agents", "Rule-based (free)", "Safety drill: rogue agents (free)"]
+ENGINES = ["Claude agents", "Deterministic"]  # the rogue-agent safety drill is a demo step, not an engine
 STAKEHOLDER_TITLE = {"ATC": "Air traffic controller", "PILOT": "Pilot", "GROUND": "Ground operations lead"}
 
 
@@ -46,9 +46,9 @@ NAMES = _Profile("name")
 def make_engine_agents(engine: str, model: str, effort: str, **kw) -> dict:
     from agents import make_agents
     from baseline_agents import make_drill_agents, make_rule_agents
-    if engine.startswith("Rule"):
+    if engine.startswith(("Deterministic", "Rule")):
         return make_rule_agents()
-    if engine.startswith("Safety drill"):
+    if engine.startswith(("Safety drill", "Drill")):
         return make_drill_agents()
     return make_agents(model=model, effort=effort, **kw)
 
@@ -100,12 +100,15 @@ def apply_theme() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
 
 
-def hero(subtitle: str, compact: bool = False) -> None:
+TITLE = "AIR CONTROL MANAGEMENT CENTER"
+
+
+def hero(subtitle: str = "", compact: bool = False) -> None:
     left, right = st.columns([1, 2] if not compact else [1, 4], vertical_alignment="center")
     video = ROOT / "assets" / "roster.mp4"
     if video.exists():
         left.video(str(video), autoplay=True, loop=True, muted=True)
-    right.markdown(f"<div class='ops-title'>A-CDM OPS CENTER</div><div class='ops-sub'>{subtitle}</div>",
+    right.markdown(f"<div class='ops-title'>{TITLE}</div>" + (f"<div class='ops-sub'>{subtitle}</div>" if subtitle else ""),
                    unsafe_allow_html=True)
     st.markdown("<div class='runway'></div>", unsafe_allow_html=True)
 
@@ -269,7 +272,8 @@ def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool =
             for d in data.directives:
                 st.caption(f"→ {AVATARS[d.agent]} {d.instruction}")
     elif kind == "system":
-        icon = {"consensus": "✅", "fallback": "🛑", "stale_reply": "🕓", "human_rejected": "👤"}.get(data["kind"], "🚫")
+        icon = {"consensus": "✅", "ratified": "✅", "fallback": "🛑", "stale_reply": "🕓", "human_rejected": "👤",
+                "stakeholder_objection": "↩️", "moderator_unavailable": "⚠️"}.get(data["kind"], "🚫")
         with st.chat_message("SYSTEM", avatar=AVATARS["SYSTEM"]):
             st.markdown(f"{icon} **{data['kind'].replace('_', ' ').upper()}**: {data['text']}")
     elif kind == "validation":
@@ -412,3 +416,56 @@ def render_emergency(s: Scenario, plan: EmergencyPlan, readbacks: dict | None = 
                 st.caption(f"📻 Readback: {readbacks[key]}")
     if duty_phone():
         st.link_button(f"📞 Call duty manager {duty_phone()}", f"tel:{duty_phone()}")
+
+
+# ============================================================================
+# Readable weather panel (replaces the one-line attribution banner)
+# ============================================================================
+def weather_card(s: Scenario) -> None:
+    wx = s.weather
+    if wx is None:
+        st.info("Weather: no source available for this flight (treated as unknown).", icon="🌦️")
+        return
+    wind = (f"{wx.wind_dir_deg:03.0f}° / {wx.wind_kt:.0f} kt" + (f", gusts {wx.gust_kt:.0f}" if wx.gust_kt else "")
+            if wx.wind_kt is not None and wx.wind_dir_deg is not None else "n/a")
+    phenomena = [x for x, on in (("⚡ Thunderstorm", wx.thunderstorm), ("☁️ CB / convection", wx.convective_nearby
+                                 and not wx.thunderstorm), ("❄️ Freezing precip / snow", wx.freezing_precip_or_snow)) if on]
+    impact = ("🔴 Destination weather is affecting arrivals" if s.weather_at_destination
+              else "🟢 Destination is fine: the WEATHER_DELAY happened en route / at the origin")
+    with st.container(border=True):
+        st.markdown(f"**🌦️ Weather at {wx.airport_icao}** · {wx.mode.lower()} · valid {wx.valid_local} local  \n{impact}")
+        c = st.columns(5)
+        c[0].metric("Conditions", wx.flight_category)
+        c[1].metric("Wind", wind)
+        c[2].metric("Visibility", f"{wx.visibility_sm:g} sm" if wx.visibility_sm is not None else "n/a")
+        c[3].metric("Ceiling", f"{wx.ceiling_ft:,} ft" if wx.ceiling_ft else "none")
+        c[4].metric("Holding PIREPs", f"turb {wx.hold_turbulence}", f"icing {wx.hold_icing} · {len(wx.pireps)} rpt",
+                    delta_color="off")
+        rows = [{"Runway": r.id, "Status": "Open" if r.closed_until <= -999 else f"Closed until {s.clock(r.closed_until)}",
+                 "Reason": "" if r.closed_until <= -999 else r.closure_reason,
+                 "Crosswind kt": r.crosswind_kt, "Tailwind kt": r.tailwind_kt} for r in s.runways]
+        left, right = st.columns([3, 2])
+        left.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        right.markdown("**Hazards**  \n" + ("  \n".join(f"- {p}" for p in phenomena) or "- none reported")
+                       + (f"  \n- 🌩️ Ramp closed (lightning) until {s.clock(s.ramp_closed_until)}"
+                          if s.ramp_closed_until > -999 else ""))
+        if wx.metar:
+            st.caption(f"METAR {wx.metar}")
+
+
+# ============================================================================
+# MAYDAY: available on every page, behind a confirmation
+# ============================================================================
+@st.dialog("🚨 Declare MAYDAY")
+def mayday_dialog() -> None:
+    from emergency import KIND_LABEL
+    st.markdown("This **abandons any negotiation** and issues the deterministic emergency plan to every desk at once: "
+                "priority landing, stand and fire/medical services. Alarms and notifications go out immediately.")
+    kind = st.radio("Emergency type", list(KIND_LABEL), format_func=KIND_LABEL.get, horizontal=True)
+    reason = st.text_input("Reason (optional)", placeholder="e.g. engine fire on approach")
+    c1, c2 = st.columns(2)
+    if c1.button("CONFIRM MAYDAY", type="primary", width="stretch"):
+        st.session_state.mayday_request = {"kind": kind, "reason": reason}
+        st.rerun()
+    if c2.button("Cancel", width="stretch"):
+        st.rerun()

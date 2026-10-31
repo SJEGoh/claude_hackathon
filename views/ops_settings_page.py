@@ -11,6 +11,31 @@ hero("Ops settings · runway condition, approach mode, ramp staffing, weather wa
      "top of the organisers' workbook limits: it can only make operations stricter.", compact=True)
 
 cfg = O.get()
+
+with st.container(border=True):
+    st.markdown("### 🎬 Guided demo")
+    st.markdown("Walks through the whole system on **one real DOT 2015 flight: UA1112, Washington Dulles → Denver, "
+                "6 May 2015** (WEATHER_DELAY 37 min, LATE_AIRCRAFT_DELAY 26 min). That evening Denver had a "
+                "thunderstorm with lightning and moderate turbulence, all four runways briefly closed, the scheduled "
+                "stand was still occupied and the fuel margin was tight.")
+    st.caption("Steps: meet the team · brief the Chief with the DOT row · a cross-domain handoff · the bounded "
+               "negotiation (structured messages, constraint checks, under 3 turns, thinking, ratification) · rogue "
+               "agents blocked by the safety engine · AI outage → deterministic fallback · weather watch and "
+               "notifications · MAYDAY · traceable log. You click ▶ to run each step, so you can talk over it.")
+    d1, d2 = st.columns([2, 1])
+    mode = d1.radio("Agents", ["live", "free"], horizontal=True,
+                    format_func=lambda m: "Claude agents (live, about $1-2)" if m == "live" else "Deterministic (free)")
+    if d2.button("🎬 Start guided demo", type="primary", width="stretch"):
+        for k in list(st.session_state.keys()):
+            if k.startswith("oc_"):
+                del st.session_state[k]
+        st.session_state.update(demo={"step": 0, "mode": mode}, oc_channel="group",
+                                demo_engine="Claude agents" if mode == "live" else "Deterministic")
+        st.switch_page("views/ops_chat.py")
+
+if st.session_state.get("mayday_request"):
+    st.switch_page("views/ops_chat.py")  # the emergency applies to the active flight in CHATS
+
 tab_cfg, tab_watch = st.tabs(["⚙️ Settings", "📡 Weather watch board"])
 
 with tab_cfg:

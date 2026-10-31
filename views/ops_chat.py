@@ -23,7 +23,11 @@ from emergency import KIND_LABEL, plan_emergency, readbacks
 from escalation import Alarm, dispatch
 from negotiation import Autonomy, ConsensusLog, NegotiationSession
 from scenario import load_disrupted_flights
-from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, get_scenario, hero, make_engine_agents,
+import voice
+from baseline_agents import make_drill_agents
+from stress import OutageAgent
+from ui_common import fire_test_alert
+from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, get_scenario, hero, make_engine_agents, weather_card,
                        ratification_form, render_emergency, render_event, render_outcome, timeline)
 
 CHANNELS = ["group", "MODERATOR", "ATC", "PILOT", "GROUND"]
@@ -53,41 +57,51 @@ S.setdefault("oc_emergency", None)
 S.setdefault("oc_fire", None)
 
 # ============================================================================
-# Sidebar: roster + settings
+# Sidebar: channels (with each agent's picture and status) + settings
 # ============================================================================
+CHANNEL_NAME = {"group": "#ops-team", "MODERATOR": "Chief of Staff", "ATC": "ATC", "PILOT": "Flight Crew",
+                "GROUND": "AOCC"}
+DOT = {"online": "🟢", "busy": "🔴", "offline": "🟡"}
+KEY_OK = len(os.environ.get("ANTHROPIC_API_KEY", "")) > 40
+
 with st.sidebar:
     st.subheader("Channels")
-    st.radio("channel", CHANNELS, key="oc_channel", label_visibility="collapsed", format_func=LABEL.get)
-    st.caption("Team status")
-    roster = {a: st.empty() for a in ROLES}
+    dots: dict[str, "st.delta_generator.DeltaGenerator"] = {}
+    for c in CHANNELS:
+        a1, a2, a3 = st.columns([1, 4, 1.2], vertical_alignment="center")
+        av = "👥" if c == "group" else AVATARS[c]
+        if str(av).endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+            a1.image(av, width=30)
+        else:
+            a1.markdown(f"<div style='font-size:22px;text-align:center'>{av}</div>", unsafe_allow_html=True)
+        a2.button(CHANNEL_NAME[c], key=f"ch_{c}", width="stretch",
+                  type="primary" if c == S.oc_channel else "secondary",
+                  on_click=lambda c=c: S.update(oc_channel=c))
+        dots[c] = a3.empty()
+
+    def availability(agent: str) -> str:
+        if not KEY_OK or S.oc_status.get(agent) == "error":
+            return "offline"
+        return "busy" if S.oc_status.get(agent) in ("working", "waiting") else "online"
+
+    def draw_dot(c: str) -> None:
+        unread = S.oc_unread.get(c, 0) if c != S.oc_channel else 0
+        badge = f"<span style='font-size:11px;opacity:.8'> {unread}</span>" if unread else ""
+        mark = "" if c == "group" else DOT[availability(c)]
+        dots[c].markdown(f"<div style='text-align:center' title='{availability(c) if c != 'group' else ''}'>"
+                         f"{mark}{badge}</div>", unsafe_allow_html=True)
 
     def show_status(agent: str, status: str) -> None:
         S.oc_status[agent] = status
-        unread = S.oc_unread.get(agent, 0)
-        with roster[agent].container():
-            c1, c2 = st.columns([1, 4], vertical_alignment="center")
-            av = AVATARS[agent]
-            if str(av).endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                c1.image(av, width=34)
-            else:
-                c1.markdown(f"<div style='font-size:24px'>{av}</div>", unsafe_allow_html=True)
-            c2.caption(f"{STATUS_ICON[status]} **{NAMES[agent]}** · {status}"
-                       + (f" · ✉️ {unread} new" if unread and agent != S.oc_channel else ""))
+        if agent in dots:
+            draw_dot(agent)
 
-    for a in ROLES:
-        show_status(a, S.oc_status[a])
-    st.divider()
-    st.markdown("**🚨 Emergency**")
-    st.selectbox("Emergency type", list(KIND_LABEL), format_func=KIND_LABEL.get, key="oc_em_kind",
-                 label_visibility="collapsed")
-    st.button("🚨 DECLARE MAYDAY", type="primary", width="stretch", disabled=S.oc_scenario is None,
-              help="Abandon negotiation; the deterministic emergency planner decides instantly and every desk "
-                   "gets its checklist at once.",
-              on_click=lambda: S.update(oc_fire=S.oc_em_kind, oc_channel="group"))
+    for c in CHANNELS:
+        draw_dot(c)
+    st.caption("🟢 online · 🔴 busy · 🟡 offline")
     st.divider()
     with st.expander("Settings", expanded=False):
-        key_ok = len(os.environ.get("ANTHROPIC_API_KEY", "")) > 40
-        st.caption("✅ API key loaded from .env" if key_ok else "⚠️ No API key: add it to .env")
+        st.caption("✅ API key loaded from .env" if KEY_OK else "⚠️ No API key: add it to .env")
         model = st.selectbox("Model", [DEFAULT_MODEL, "claude-sonnet-5-5", "claude-haiku-5-5"])
         effort = st.select_slider("Effort", ["low", "medium", "high"], value="medium", help="medium shows the agents' thinking summaries; low is cheaper and often skips thinking")
         engine = st.radio("Negotiation engine", ENGINES)
@@ -98,7 +112,7 @@ with st.sidebar:
     st.caption(f"Chat spend this session: ${u['cost_usd']:.3f} · {u['calls']} calls")
     if st.button("🗑️ Clear all chats"):
         for k in list(S.keys()):
-            if k.startswith("oc_"):
+            if k.startswith(("oc_", "demo")):
                 del S[k]
         st.rerun()
 
@@ -283,7 +297,8 @@ def talk(agent: str, ch: str, text: str, asked_by: str = "the duty officer", all
     show_status(agent, "working")
     with st.spinner(f"{NAMES[agent]} is typing…"):
         reply, metrics, thinking = converse(client, model, effort, system_for(agent, ch), c, content, tools, impl, on_tool)
-    show_status(agent, "waiting" if (S.oc_pending and agent == "MODERATOR") else "idle")
+    show_status(agent, "error" if metrics and not metrics[-1].ok else
+                "waiting" if (S.oc_pending and agent == "MODERATOR") else "idle")
     S.oc_metrics.extend(metrics)
     cost = sum(m.cost_usd for m in metrics)
     post(ch, {"t": "msg", "who": agent, "text": reply, "thinking": thinking,
@@ -395,11 +410,12 @@ def t_start_negotiation(autonomy: str) -> str:
         return "No flight loaded. Use find_flights and load_flight first."
     if S.oc_pending is not None or S.oc_ratify is not None:
         return "A negotiation is already paused for a decision or stakeholder votes; finish that first."
-    agents = make_engine_agents(engine, model, effort)
+    eng = S.get("demo_engine") or engine
+    agents = make_engine_agents(eng, model, effort)
     S.oc_session = NegotiationSession(s, agents, Autonomy(autonomy))
     S.oc_outcome = None
     post("group", {"t": "note", "text": f"▶ Negotiation started for {s.flight} · autonomy {autonomy.lower()} · "
-                                        f"{model if engine == ENGINES[0] else engine.lower()}"},
+                                        f"{model if eng == ENGINES[0] else eng.lower()}"},
          log_line=f"SYSTEM: negotiation started ({autonomy})")
     return pump()
 
@@ -475,7 +491,7 @@ def fire_emergency(kind: str, reason: str = "", by: str = "duty officer") -> str
         show_status(a, "working")
         post(a, {"t": "msg", "who": a, "text": f"🚨 **{KIND_LABEL[kind]} {s.flight}**. My actions:\n- "
                  + "\n- ".join(plan.actions[a])})
-    if engine == ENGINES[0]:  # readbacks never delay the plan: it is already on everyone's screen
+    if (S.get("demo_engine") or engine) == ENGINES[0]:  # readbacks never delay the plan: it is already on everyone's screen
         with st.spinner("Desks reading back…"):
             rb = readbacks(plan, make_engine_agents(engine, model, effort))
         for a, text in rb.items():
@@ -500,27 +516,135 @@ CHIEF_IMPL = {"compare_plans": t_compare_plans, "declare_emergency": t_declare_e
               "ask_specialist": t_ask_specialist, "get_negotiation_record": t_get_record}
 
 # ============================================================================
+# Guided demo (started from Ops settings): one real DOT flight, every feature, presenter-paced
+# ============================================================================
+DEMO_ROW = 115187  # UA1112 IAD->DEN 2015-05-06: WEATHER_DELAY 37, LATE_AIRCRAFT_DELAY 26, real TS + lightning at KDEN
+DEMO_STEPS = [
+    ("Meet the team", "Four independent agents introduced themselves above: three specialists with private data "
+     "and a Chief of Staff who chairs. Each is its own Claude call; none sees another's private data."),
+    ("Brief the Chief of Staff", "We hand the Chief one row of the US DOT 2015 data: UA1112 Dulles to Denver, "
+     "WEATHER_DELAY 37 and LATE_AIRCRAFT_DELAY 26. It loads the flight with the real Denver weather of that evening "
+     "(thunderstorm, lightning, moderate turbulence)."),
+    ("Ask the wrong specialist", "We ask ATC a fuel question. Fuel is the Captain's private data, so ATC hands it "
+     "over instead of guessing (one-hop referral)."),
+    ("Negotiate", "The Chief starts the bounded negotiation: structured messages, every plan checked by the "
+     "deterministic safety engine, under 3 turns, thinking summaries, then the stakeholders ratify. Supervised: "
+     "if the fuel margin is tight you'll be asked to decide."),
+    ("Safety drill: rogue agents", "Adversarial agents try to land past the fuel limit and accept it. The safety "
+     "engine overrides every unsafe ACCEPT and the non-AI planner takes over."),
+    ("AI outage: deterministic fallback", "Every AI agent goes offline (like the 2025 Newark radar outage). The "
+     "independent non-AI planner decides and the alarm goes out."),
+    ("Weather watch and notifications", "The automated checks run on live METAR/TAF/PIREP data and notify only on "
+     "change. We fire a test ALARM: toast, chime, and any phone/Slack/Mac channels set in Ops settings."),
+    ("MAYDAY", "An engine fire on approach. Negotiation is abandoned; the deterministic emergency plan is issued "
+     "in milliseconds and every desk gets its checklist. (In real use: the red button and CONFIRM.)"),
+    ("Wrap-up", "Every step is in a hash-chained consensus log (logs/). Try a DM, or the 🎙️ microphone."),
+]
+
+
+def demo_note(text: str) -> None:
+    post("group", {"t": "note", "text": f"🎬 {text}"}, log_line=f"DEMO: {text}")
+
+
+def demo_negotiate(agents: dict, label: str) -> None:
+    s = scenario()
+    S.oc_session, S.oc_outcome = NegotiationSession(s, agents, Autonomy.AUTONOMOUS), None
+    post("group", {"t": "note", "text": f"▶ {label} for {s.flight} · autonomous"}, log_line=f"SYSTEM: {label}")
+    pump()
+
+
+def run_demo_step(i: int, live: bool) -> None:
+    S.oc_channel = "group"
+    title = DEMO_STEPS[i][0]
+    demo_note(f"Demo step {i + 1}/{len(DEMO_STEPS)}: {title}")
+    busy = S.oc_pending is not None or S.oc_ratify is not None
+    if i == 0:
+        demo_note("Four agents introduced themselves above. Next: give the Chief of Staff a DOT record.")
+    elif i == 1:
+        if live:
+            msg = ("Load DOT row 115187 (UA1112, Dulles to Denver, 6 May 2015, WEATHER_DELAY 37 min, "
+                   "LATE_AIRCRAFT_DELAY 26 min) with historical weather and brief the team in three bullets.")
+            post("group", {"t": "msg", "who": "user", "text": msg}, log_line=f"DUTY OFFICER: {msg}")
+            talk("MODERATOR", "group", msg)
+        else:
+            t_load_flight(DEMO_ROW, "HISTORICAL")
+    elif scenario() is None:
+        demo_note("Load the flight first (step 2).")
+    elif i == 2:
+        if live:
+            msg = "@ATC how much fuel will UA1112 have on landing if it takes your earliest conflict-free slot?"
+            post("group", {"t": "msg", "who": "user", "text": msg}, log_line=f"DUTY OFFICER: {msg}")
+            talk("ATC", "group", msg)
+        else:
+            demo_note("Handoffs between agents need Claude agents: switch the demo to live to see this step.")
+    elif i in (3, 4, 5) and busy:
+        demo_note("A decision or vote card is waiting above: answer it, then run this step again.")
+        return
+    elif i == 3:
+        if live:
+            msg = "Run the negotiation for UA1112, supervised."
+            post("group", {"t": "msg", "who": "user", "text": msg}, log_line=f"DUTY OFFICER: {msg}")
+            talk("MODERATOR", "group", msg)
+        else:
+            t_start_negotiation("SUPERVISED")
+    elif i == 4:
+        demo_negotiate(make_drill_agents(), "Safety drill: rogue agents")
+    elif i == 5:
+        demo_negotiate({k: OutageAgent(k) for k in ("ATC", "PILOT", "GROUND")}, "AI outage drill")
+    elif i == 6:
+        sent = fire_test_alert()
+        import watch as _watch
+        active = _watch.active_alerts()
+        demo_note("Test ALARM fired" + (f" to {', '.join(sent)}" if sent else " (screen only)") + ". Live watch now: "
+                  + ("; ".join(f"{a.airport} {a.title} ({a.severity})" for a in active[:4]) or "all clear") + ".")
+    elif i == 7:
+        post("group", {"t": "msg", "who": "user", "text": "🚨 **MAYDAY CONFIRMED**: Technical failure (engine fire)"},
+             log_line="DUTY OFFICER: MAYDAY TECHNICAL engine fire")
+        fire_emergency("TECHNICAL", "engine fire on approach")
+    S.demo["step"] = i + 1
+
+
+# ============================================================================
 # Page
 # ============================================================================
 s = scenario()
-hero("Ops chat · talk to your AI operations team. Group chat in #ops-team, private DMs with each agent.",
-     compact=True)
+hero(compact=True)
 if s is not None:
     fids_board(s, S.oc_outcome, emergency=S.oc_emergency, running=S.oc_session is not None and S.oc_outcome is None,
                pending=S.oc_pending is not None or S.oc_ratify is not None)
+if S.get("demo"):
+    i, live = S.demo["step"], S.demo["mode"] == "live"
+    with st.container(border=True):
+        if i >= len(DEMO_STEPS):
+            st.markdown("🎬 **Guided demo complete.**")
+            if st.button("✖ Close demo"):
+                S.pop("demo", None), S.pop("demo_engine", None)
+                st.rerun()
+        else:
+            title, explain = DEMO_STEPS[i]
+            st.markdown(f"🎬 **Guided demo · step {i + 1} of {len(DEMO_STEPS)}: {title}** "
+                        f"· {'live Claude agents' if live else 'deterministic (free)'}")
+            st.caption(explain)
+            b1, b2, b3, _ = st.columns([1.3, 1, 1, 3])
+            b1.button("▶ Run this step", type="primary", key="demo_run", on_click=lambda: S.update(demo_go=True))
+            b2.button("⏭ Skip", key="demo_skip", on_click=lambda: S.demo.update(step=i + 1))
+            if b3.button("✖ End demo", key="demo_end"):
+                S.pop("demo", None), S.pop("demo_engine", None)
+                st.rerun()
+
 if channel == "group":
     st.subheader("👥 #ops-team")
     st.caption("You, the Chief of Staff and the three specialists. Messages go to the Chief unless you @mention "
                "@ATC, @Pilot, @Ground or @Chief. Negotiations run here.")
 else:
-    st.subheader(f"{LABEL[channel]} · {NAMES[channel]}")
+    st.subheader(f"✉️ {NAMES[channel]}")
     st.caption(f"Private DM with {NAMES[channel]}. Only you and this agent see it; it keeps its own memory "
                "and is aware of what happens in #ops-team.")
 
 if s is not None:
     with st.expander(f"✈️ Active flight: {s.flight} {s.origin}→{s.destination} {s.date} · SIBT {s.clock(0)} · "
                      f"WX {s.weather_delay_min} · LATE {s.late_aircraft_delay_min}"):
-        st.info(s.weather_attribution, icon="🌦️")
+        weather_card(s)
         out = S.oc_outcome
         st.plotly_chart(timeline(s, out.proposal if out else None, out.reference.proposal if out else None),
                         width="stretch", key=f"tl_{channel}")
@@ -574,18 +698,68 @@ if S.oc_click is not None and req is not None:
     pump(choice)
     st.rerun()
 
-if S.oc_fire is not None:
-    kind, S.oc_fire = S.oc_fire, None
-    post("group", {"t": "msg", "who": "user", "text": f"🚨 **MAYDAY**: {KIND_LABEL[kind]} declared"},
-         log_line=f"DUTY OFFICER: MAYDAY {kind}")
-    fire_emergency(kind)
+if S.get("mayday_request"):
+    req_m = S.pop("mayday_request")
+    if scenario() is None:
+        st.toast("MAYDAY needs an active flight: load one first (ask the Chief of Staff).", icon="⚠️")
+    else:
+        S.oc_channel = "group"
+        post("group", {"t": "msg", "who": "user", "text": f"🚨 **MAYDAY CONFIRMED**: {KIND_LABEL[req_m['kind']]}"
+                       + (f" ({req_m['reason']})" if req_m["reason"] else "")},
+             log_line=f"DUTY OFFICER: MAYDAY {req_m['kind']} {req_m['reason']}")
+        fire_emergency(req_m["kind"], req_m["reason"])
+        st.rerun()
+
+if S.pop("demo_go", False) and S.get("demo"):
+    run_demo_step(S.demo["step"], S.demo["mode"] == "live")
     st.rerun()
+
+# Voice: talk to the agents (recorded in the browser, transcribed locally with Whisper)
+voice_text = None
+if not S.get("voice_enabled"):
+    if not S.get("voice_dismissed"):
+        with st.container(border=True):
+            st.markdown("🎙️ **Talk to the agents with your voice?**")
+            st.caption("When you press the microphone, your browser will ask to **allow microphone access**: choose "
+                       "Allow. On a Mac, if it never asks, open System Settings → Privacy & Security → Microphone "
+                       "and switch your browser on. Speech recognition runs **locally on this computer** (Whisper, "
+                       "offline): no audio leaves your machine, so no macOS Speech Recognition permission is needed. "
+                       "The first time downloads the ~140 MB speech model.")
+            v1, v2, _ = st.columns([1.2, 1, 4])
+            if v1.button("🎙️ Enable voice", type="primary"):
+                with st.spinner("Loading the local speech model (first time downloads ~140 MB)…"):
+                    voice.warm_up()
+                S.voice_enabled = True
+                st.rerun()
+            if v2.button("Not now"):
+                S.voice_dismissed = True
+                st.rerun()
+else:
+    rec = st.audio_input("🎙️ Speak to " + ("the team (say “ATC…”, “Captain…”, or just talk to the Chief)"
+                                          if channel == "group" else NAMES[channel]), key=f"mic_{channel}")
+    if rec is not None:
+        fp = voice.fingerprint(rec.getvalue())
+        if fp != S.get("voice_last"):
+            S.voice_last = fp
+            with st.spinner("Transcribing locally…"):
+                voice_text = voice.transcribe(rec.getvalue())
+            if not voice_text:
+                st.toast("Didn't catch that: try again a little closer to the mic.", icon="🎙️")
 
 placeholder = ("Message the team… (@ATC, @Pilot, @Ground to address someone)" if channel == "group"
                else f"Message {NAMES[channel]} privately…")
 prompt = st.chat_input(placeholder, disabled=len(os.environ.get("ANTHROPIC_API_KEY", "")) < 40)
+if voice_text and not prompt:
+    prompt = voice_text
+    # spoken names work like @mentions in the group chat
+    for spoken, tag in (("atc", "@ATC"), ("captain", "@Captain"), ("pilot", "@Pilot"), ("ground", "@Ground"),
+                        ("aocc", "@AOCC"), ("chief", "@Chief")):
+        if channel == "group" and re.match(rf"^\W*{spoken}\b", prompt, re.I):
+            prompt = f"{tag} {prompt}"
+            break
 if prompt:
-    post(channel, {"t": "msg", "who": "user", "text": prompt}, log_line=f"DUTY OFFICER: {prompt}")
+    post(channel, {"t": "msg", "who": "user", "text": prompt, "meta": "🎙️ spoken" if voice_text else None},
+         log_line=f"DUTY OFFICER: {prompt}")
     if channel == "group":
         targets = list(dict.fromkeys(MENTIONS[m.lower()] for m in re.findall(r"@\w+", prompt)
                                      if m.lower() in MENTIONS)) or ["MODERATOR"]
