@@ -1,0 +1,399 @@
+"""Ops chat: a team chat (#ops-team) plus a private DM with every agent, like a Grok-style bot roster.
+
+- #ops-team: you, the Chief of Staff and the three specialists. Messages go to the Chief unless you
+  @mention someone (@ATC, @Pilot, @Ground, @Chief). The bounded negotiation plays out here.
+- DMs: private 1:1 chats. Each agent keeps its own memory per channel; other agents never see your DMs.
+"""
+import json
+import os
+import re
+from datetime import datetime
+
+import anthropic
+import streamlit as st
+
+import config  # noqa: F401  (loads .env)
+from agents import DEFAULT_MODEL, ROLES, make_agents, render_brief, render_message
+from agents.chief import CHIEF_SYSTEM, CHIEF_TOOLS
+from agents.conversation import CHAT_STYLE, Conversation, converse, specialist_tools
+from baseline_agents import make_rule_agents
+from monitoring import summarise
+from negotiation import Autonomy, NegotiationSession
+from scenario import load_disrupted_flights
+from ui_common import AVATARS, NAMES, ROOT, get_scenario, plan_text, render_event, render_outcome, timeline
+
+CHANNELS = ["group", "MODERATOR", "ATC", "PILOT", "GROUND"]
+LABEL = {"group": "👥 #ops-team", "MODERATOR": "🧭 Chief of Staff", "ATC": "🗼 ATC", "PILOT": "🧑‍✈️ Flight Crew",
+         "GROUND": "🧳 AOCC"}
+STATUS_ICON = {"idle": "🟢", "working": "🟡", "waiting": "🔴"}
+MENTIONS = {"@atc": "ATC", "@pilot": "PILOT", "@crew": "PILOT", "@captain": "PILOT", "@ground": "GROUND",
+            "@aocc": "GROUND", "@chief": "MODERATOR", "@cos": "MODERATOR"}
+CHAT_LOG = ROOT / "logs" / f"chat_{datetime.now():%Y%m%d}.jsonl"
+
+S = st.session_state
+S.setdefault("oc_items", {c: [] for c in CHANNELS})
+S.setdefault("oc_convs", {})
+S.setdefault("oc_status", {a: "idle" for a in ROLES})
+S.setdefault("oc_unread", {c: 0 for c in CHANNELS})
+S.setdefault("oc_group_log", [])
+S.setdefault("oc_scenario", None)
+S.setdefault("oc_session", None)
+S.setdefault("oc_pending", None)
+S.setdefault("oc_outcome", None)
+S.setdefault("oc_metrics", [])
+S.setdefault("oc_click", None)
+S.setdefault("oc_channel", "group")
+
+# ============================================================================
+# Sidebar: roster + settings
+# ============================================================================
+with st.sidebar:
+    st.subheader("Channels")
+    st.radio("channel", CHANNELS, key="oc_channel", label_visibility="collapsed", format_func=LABEL.get)
+    st.caption("Team status")
+    roster = {a: st.empty() for a in ROLES}
+
+    def show_status(agent: str, status: str) -> None:
+        S.oc_status[agent] = status
+        unread = S.oc_unread.get(agent, 0)
+        roster[agent].caption(f"{STATUS_ICON[status]} {NAMES[agent]} · {status}"
+                              + (f" · ✉️ {unread} new" if unread and agent != S.oc_channel else ""))
+
+    for a in ROLES:
+        show_status(a, S.oc_status[a])
+    st.divider()
+    with st.expander("Settings", expanded=False):
+        key_ok = len(os.environ.get("ANTHROPIC_API_KEY", "")) > 40
+        st.caption("✅ API key loaded from .env" if key_ok else "⚠️ No API key: add it to .env")
+        model = st.selectbox("Model", [DEFAULT_MODEL, "claude-sonnet-5-5", "claude-haiku-5-5"])
+        effort = st.select_slider("Effort", ["low", "medium", "high"], value="low")
+        engine = st.radio("Negotiation engine", ["Claude agents", "Rule-based (free)"])
+        default_autonomy = st.radio("Default autonomy", [a.value for a in Autonomy], index=1,
+                                    format_func=lambda a: a.replace("_", " ").title())
+        sound = st.toggle("Audible alarms", value=True)
+    u = summarise(S.oc_metrics)
+    st.caption(f"Chat spend this session: ${u['cost_usd']:.3f} · {u['calls']} calls")
+    if st.button("🗑️ Clear all chats"):
+        for k in list(S.keys()):
+            if k.startswith("oc_"):
+                del S[k]
+        st.rerun()
+
+channel = S.oc_channel
+S.oc_unread[channel] = 0
+client = anthropic.Anthropic(max_retries=1)
+
+
+# ============================================================================
+# Posting + rendering
+# ============================================================================
+def scenario():
+    return S.oc_scenario
+
+
+def draw(item: dict) -> None:
+    t = item["t"]
+    s = scenario()
+    if t == "msg":
+        who = item["who"]
+        with st.chat_message("user" if who == "user" else who, avatar=AVATARS.get(who, "👤")):
+            if who != "user":
+                st.markdown(f"**{NAMES.get(who, who)}**" + (f" · _to the team_" if item.get("via") else ""))
+            st.markdown(item["text"])
+            if item.get("meta"):
+                st.caption(item["meta"])
+    elif t == "tool":
+        st.caption(f"🔧 {NAMES.get(item['who'], item['who'])} used `{item['name']}"
+                   f"({', '.join(f'{k}={v}' for k, v in item['args'].items())})`")
+    elif t == "event" and s is not None:
+        render_event(s, item["kind"], item["data"], live=item.get("live", False), sound=sound,
+                     autonomy=S.oc_session.autonomy.value if S.oc_session else "")
+        item["live"] = False
+    elif t == "outcome" and s is not None:
+        render_outcome(s, item["data"])
+    elif t == "note":
+        st.caption(item["text"])
+
+
+def post(ch: str, item: dict, log_line: str | None = None) -> None:
+    """Append to a channel; draw immediately if the channel is on screen."""
+    S.oc_items[ch].append(item)
+    if ch == channel:
+        draw(item)
+    else:
+        S.oc_unread[ch] += 1
+    if ch == "group" and log_line:
+        S.oc_group_log.append(log_line)
+    if item["t"] == "msg":
+        CHAT_LOG.parent.mkdir(exist_ok=True)
+        with CHAT_LOG.open("a") as f:
+            f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "channel": ch,
+                                "who": item["who"], "text": item["text"]}) + "\n")
+
+
+# ============================================================================
+# Agents in chat
+# ============================================================================
+AGENT_OBJECTS = {k: cls(None) for k, cls in ROLES.items()}  # for role text and private briefs only
+
+
+def conv(agent: str, ch: str) -> Conversation:
+    key = f"{agent}|{ch}"
+    if key not in S.oc_convs:
+        S.oc_convs[key] = Conversation(agent, ch)
+    return S.oc_convs[key]
+
+
+def system_for(agent: str, ch: str) -> str:
+    where = ("This is #ops-team, the group chat: the duty officer, the Chief of Staff and all specialists read "
+             "it." if ch == "group" else "This is a PRIVATE direct message with the duty officer; no other agent "
+             "sees it.")
+    if agent == "MODERATOR":
+        return f"{CHIEF_SYSTEM}\n\n{where}"
+    return f"{AGENT_OBJECTS[agent].role}\n\n{CHAT_STYLE}\n\n{where}"
+
+
+def context_for(agent: str, c: Conversation) -> str:
+    parts, s = [], scenario()
+    sig = f"{s.flight}|{s.date}|{s.weather_mode}" if s else "none"
+    if sig != c.context_sig:
+        c.context_sig = sig
+        if s is None:
+            parts.append("## Active flight\nNone loaded yet.")
+        elif agent == "MODERATOR":
+            parts.append(f"## Active flight (public facts)\n{AGENT_OBJECTS['MODERATOR'].public_brief(s)}")
+        else:
+            parts.append(f"## Your private instruments for the active flight\n{AGENT_OBJECTS[agent].private_brief(s)}")
+    new = S.oc_group_log[c.group_cursor:]
+    c.group_cursor = len(S.oc_group_log)
+    if new and c.channel != "group":
+        parts.append("## Recent #ops-team activity (for awareness)\n" + "\n".join(new[-30:]))
+    elif new:
+        parts.append("## New in #ops-team since your last message\n" + "\n".join(new[-40:]))
+    if agent == "MODERATOR" and S.oc_pending is not None:
+        req = S.oc_pending
+        parts.append(f"## PENDING DECISION ({req.code}): {req.title}\n" + "\n".join(req.briefing) + "\nOptions: "
+                     + "; ".join(f"{o.id} = {o.label} ({o.description})" for o in req.options))
+    return "\n\n".join(parts)
+
+
+def talk(agent: str, ch: str, text: str, asked_by: str = "the duty officer") -> str:
+    """One chat turn with an agent in a channel; posts its reply there and returns it."""
+    c = conv(agent, ch)
+    ctx = context_for(agent, c)
+    content = (ctx + "\n\n" if ctx else "") + f"## Message from {asked_by}\n{text}"
+    if agent == "MODERATOR":
+        tools, impl = CHIEF_TOOLS, CHIEF_IMPL
+    else:
+        tools, impl = specialist_tools(agent, scenario)
+
+    def on_tool(name, args, result):
+        if name not in ("ask_specialist",):  # specialists' answers are posted as their own messages
+            post(ch, {"t": "tool", "who": agent, "name": name, "args": args})
+
+    show_status(agent, "working")
+    with st.spinner(f"{NAMES[agent]} is typing…"):
+        reply, metrics = converse(client, model, effort, system_for(agent, ch), c, content, tools, impl, on_tool)
+    show_status(agent, "waiting" if (S.oc_pending and agent == "MODERATOR") else "idle")
+    S.oc_metrics.extend(metrics)
+    cost = sum(m.cost_usd for m in metrics)
+    post(ch, {"t": "msg", "who": agent, "text": reply, "meta": f"{sum(m.latency_s for m in metrics):.1f}s · ${cost:.4f}"},
+         log_line=f"{agent}: {reply}")
+    return reply
+
+
+# ============================================================================
+# Chief of Staff tools (they drive the shared session)
+# ============================================================================
+def t_find_flights(destination_airport: str, bucket: str, min_weather_delay: int, limit: int) -> str:
+    df = load_disrupted_flights(limit=None)
+    if destination_airport:
+        df = df[df.DESTINATION_AIRPORT == destination_airport.upper()]
+    if bucket != "any":
+        df = df[df.BUCKET == bucket]
+    if min_weather_delay:
+        df = df[df.WEATHER_DELAY >= min_weather_delay]
+    rows = [{"row_id": int(i), "flight": f"{r.AIRLINE}{r.FLIGHT_NUMBER}", "route": f"{r.ORIGIN_AIRPORT}-{r.DESTINATION_AIRPORT}",
+             "date": f"2015-{r.MONTH:02d}-{r.DAY:02d}", "sched_arr": f"{int(r.SCHEDULED_ARRIVAL):04d}",
+             "weather_delay": int(r.WEATHER_DELAY), "late_aircraft_delay": int(r.LATE_AIRCRAFT_DELAY),
+             "bucket": r.BUCKET} for i, r in df.head(max(1, min(limit, 10))).iterrows()]
+    return json.dumps({"matches": len(df), "showing": rows})
+
+
+def t_load_flight(row_id: int, weather_mode: str) -> str:
+    s = get_scenario(row_id, weather_mode)
+    S.oc_scenario, S.oc_session, S.oc_pending, S.oc_outcome = s, None, None, None
+    post("group", {"t": "note", "text": f"📂 Active flight: **{s.flight}** {s.origin}→{s.destination} {s.date}, "
+                                        f"SIBT {s.clock(0)} · WX {s.weather_delay_min} · LATE {s.late_aircraft_delay_min} "
+                                        f"· weather {weather_mode.lower()}"},
+         log_line=f"SYSTEM: active flight is now {s.flight} {s.origin}-{s.destination} {s.date}")
+    return AGENT_OBJECTS["MODERATOR"].public_brief(s)
+
+
+def t_flight_status() -> str:
+    s = scenario()
+    if s is None:
+        return "No flight loaded."
+    state = ("paused for a decision: " + S.oc_pending.title if S.oc_pending else
+             f"finished: {S.oc_outcome.status}" if S.oc_outcome else
+             "running" if S.oc_session else "not started")
+    return AGENT_OBJECTS["MODERATOR"].public_brief(s) + f"\nNegotiation: {state}."
+
+
+def pump(choice=None) -> str:
+    sess: NegotiationSession = S.oc_session
+    s = scenario()
+    note = None if channel == "group" else st.empty()
+    ev = sess.advance(choice)
+    while True:
+        kind, data = ev
+        if kind == "thinking":
+            for a in data["agents"]:
+                show_status(a, "working")
+            if note:
+                note.info(f"Negotiation running in #ops-team: {', '.join(data['agents'])} working…")
+        elif kind != "metric":
+            line = {"message": lambda: render_message(data, s), "brief": lambda: render_brief(data),
+                    "system": lambda: f"SYSTEM {data['kind']}: {data['text']}",
+                    "alarm": lambda: f"ALARM {data.code}: {data.title}"}.get(kind, lambda: None)()
+            if kind == "message":
+                show_status(data.agent, "idle")
+            if kind == "brief":
+                show_status("MODERATOR", "idle")
+            post("group", {"t": "event", "kind": kind, "data": data, "live": True}, log_line=line)
+        if kind == "decision":
+            S.oc_pending = data
+            for a in ("ATC", "PILOT", "GROUND"):
+                show_status(a, "idle")
+            show_status("MODERATOR", "waiting")
+            return (f"PAUSED for the duty officer: {data.title}. " + " ".join(data.briefing) + " Options: "
+                    + "; ".join(f"{o.id} = {o.label}: {o.description}" for o in data.options))
+        if kind == "outcome":
+            S.oc_pending, S.oc_outcome = None, data
+            post("group", {"t": "outcome", "data": data},
+                 log_line=f"OUTCOME {data.status} ({data.plan_source}) turn {data.turns_used}: "
+                          f"{render_plan(data.proposal)}")
+            for a in ROLES:
+                show_status(a, "idle")
+            return (f"OUTCOME {data.status} via {data.plan_source} at turn {data.turns_used}: "
+                    f"{render_plan(data.proposal)}; cost {data.cost} vs deterministic optimum {data.reference.cost}; "
+                    f"{len(data.alarms)} alarms; log hash chain {'verified' if data.log_verified else 'BROKEN'}.")
+        ev = sess.advance()
+
+
+def render_plan(p) -> str:
+    s = scenario()
+    return f"TLDT {s.clock(p.landing_slot_min)} (slot {p.landing_slot_min}) RWY {p.runway} stand {p.gate}"
+
+
+def t_start_negotiation(autonomy: str) -> str:
+    s = scenario()
+    if s is None:
+        return "No flight loaded. Use find_flights and load_flight first."
+    if S.oc_pending is not None:
+        return "A negotiation is already paused for a decision; resolve it first."
+    agents = make_rule_agents() if engine.startswith("Rule") else make_agents(model=model, effort=effort)
+    S.oc_session = NegotiationSession(s, agents, Autonomy(autonomy))
+    S.oc_outcome = None
+    post("group", {"t": "note", "text": f"▶ Negotiation started for {s.flight} · autonomy {autonomy.lower()} · "
+                                        f"{'rule-based agents' if engine.startswith('Rule') else model}"},
+         log_line=f"SYSTEM: negotiation started ({autonomy})")
+    return pump()
+
+
+def t_resolve_decision(option_id: str) -> str:
+    req = S.oc_pending
+    if req is None:
+        return "There is no pending decision."
+    if option_id not in {o.id for o in req.options}:
+        return f"Unknown option. Valid: {', '.join(o.id for o in req.options)}"
+    label = next(o.label for o in req.options if o.id == option_id)
+    post("group", {"t": "note", "text": f"👤 Decision relayed by the Chief of Staff: **{label}**"},
+         log_line=f"DUTY OFFICER DECISION: {label}")
+    S.oc_pending = None
+    return pump(option_id)
+
+
+def t_ask_specialist(agent: str, question: str) -> str:
+    post("group", {"t": "msg", "who": "MODERATOR", "text": f"@{agent.title()} {question}", "via": True},
+         log_line=f"MODERATOR to {agent}: {question}")
+    return talk(agent, "group", question, asked_by="the Chief of Staff (in #ops-team)")
+
+
+def t_get_record() -> str:
+    lines = [ln for ln in S.oc_group_log if ln and not ln.startswith(("MODERATOR:", "ATC:", "PILOT:", "GROUND:"))]
+    return "\n".join(lines[-80:]) or "No negotiation yet."
+
+
+CHIEF_IMPL = {"find_flights": t_find_flights, "load_flight": t_load_flight, "flight_status": t_flight_status,
+              "start_negotiation": t_start_negotiation, "resolve_decision": t_resolve_decision,
+              "ask_specialist": t_ask_specialist, "get_negotiation_record": t_get_record}
+
+# ============================================================================
+# Page
+# ============================================================================
+s = scenario()
+if channel == "group":
+    st.title("👥 #ops-team")
+    st.caption("You, the Chief of Staff and the three specialists. Messages go to the Chief unless you @mention "
+               "@ATC, @Pilot, @Ground or @Chief. Negotiations run here.")
+else:
+    st.title(LABEL[channel])
+    st.caption(f"Private DM with {NAMES[channel]}. Only you and this agent see it; it keeps its own memory "
+               "and is aware of what happens in #ops-team.")
+
+if s is not None:
+    with st.expander(f"✈️ Active flight: {s.flight} {s.origin}→{s.destination} {s.date} · SIBT {s.clock(0)} · "
+                     f"WX {s.weather_delay_min} · LATE {s.late_aircraft_delay_min}"):
+        st.info(s.weather_attribution, icon="🌦️")
+        out = S.oc_outcome
+        st.plotly_chart(timeline(s, out.proposal if out else None, out.reference.proposal if out else None),
+                        width="stretch", key=f"tl_{channel}")
+elif not S.oc_items["group"]:
+    st.info("Try: *“Find a weather-delayed flight into ORD and load it”*, then *“Run the negotiation, supervised”*. "
+            "Or DM a specialist: *“How do crosswind limits affect runway choice?”*", icon="💡")
+
+for item in S.oc_items[channel]:
+    draw(item)
+
+# Pending decision card (actionable in #ops-team; flagged everywhere)
+req = S.oc_pending
+if req is not None:
+    if channel == "group":
+        colour = {"INFO": "blue", "WARNING": "orange", "ALARM": "red"}[req.severity]
+        with st.container(border=True):
+            st.markdown(f"#### :{colour}[👤 Your decision · {req.title}]")
+            for line in req.briefing:
+                st.markdown(f"- {line}")
+            for opt in req.options:
+                c1, c2 = st.columns([1, 3])
+                if c1.button(opt.label, key=f"oc_opt_{req.code}_{req.turn}_{opt.id}",
+                             type="primary" if opt.id == req.default else "secondary"):
+                    S.oc_click = opt.id
+                    st.rerun()
+                c2.caption(opt.description)
+            st.caption("…or just tell the Chief of Staff what you want in the chat.")
+    else:
+        st.warning(f"🔴 A decision is waiting for you in #ops-team: {req.title}")
+
+if S.oc_click is not None and req is not None:
+    choice, S.oc_click = S.oc_click, None
+    label = next(o.label for o in req.options if o.id == choice)
+    post("group", {"t": "msg", "who": "user", "text": f"Decision: **{label}**"}, log_line=f"DUTY OFFICER DECISION: {label}")
+    S.oc_pending = None
+    pump(choice)
+    st.rerun()
+
+placeholder = ("Message the team… (@ATC, @Pilot, @Ground to address someone)" if channel == "group"
+               else f"Message {NAMES[channel]} privately…")
+prompt = st.chat_input(placeholder, disabled=len(os.environ.get("ANTHROPIC_API_KEY", "")) < 40)
+if prompt:
+    post(channel, {"t": "msg", "who": "user", "text": prompt}, log_line=f"DUTY OFFICER: {prompt}")
+    if channel == "group":
+        targets = list(dict.fromkeys(MENTIONS[m.lower()] for m in re.findall(r"@\w+", prompt)
+                                     if m.lower() in MENTIONS)) or ["MODERATOR"]
+        for agent in targets:
+            talk(agent, "group", prompt)
+    else:
+        talk(channel, channel, prompt)
+    st.rerun()

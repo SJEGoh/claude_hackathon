@@ -1,0 +1,8 @@
+anthropic>=2.3
+streamlit>=1.66
+pandas
+plotly
+pydantic>=2
+requests
+timezonefinder
+matplotlib
