@@ -12,11 +12,11 @@ from agents import DEFAULT_MODEL, make_agents
 from agents.atc_agent import ATCAgent
 from agents.ground_agent import GroundAgent
 from agents.pilot_agent import PilotAgent
-from baseline_agents import make_rule_agents
 from escalation import duty_phone
 from monitoring import summarise
 from negotiation import MAX_TURNS, Autonomy, NegotiationSession
-from ui_common import AVATARS, NAMES, ROOT, flights, get_scenario, render_event, render_outcome, timeline
+from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, flights, get_scenario, hero, make_engine_agents,
+                       render_event, render_outcome, timeline)
 
 AUTONOMY_HELP = {
     "AUTONOMOUS": "Never pauses. Every decision point takes its safe default; alarms still go out.",
@@ -34,8 +34,8 @@ def render(kind, data, live=False):
 # ============================================================================
 with st.sidebar:
     st.header("Agents")
-    kind = st.radio("Agent engine", ["Claude (live API)", "Rule-based (offline, free)"])
-    use_claude = kind.startswith("Claude")
+    kind = st.radio("Agent engine", ENGINES)
+    use_claude = kind == ENGINES[0]
     key_ok = len(os.environ.get("ANTHROPIC_API_KEY", "")) > 40
     if use_claude:
         st.caption("✅ API key loaded from .env" if key_ok else "⚠️ No API key: add it to .env")
@@ -81,9 +81,10 @@ if st.session_state.get("cr_scen_key") != scen_key:
 # ============================================================================
 # Header
 # ============================================================================
-st.title("✈️ A-CDM Multi-Agent Disruption Negotiation")
-st.caption(f"AUTONOMOUS SG 2026 · Challenge #2 · three independent specialists, a Chief of Staff, max {MAX_TURNS} "
-           "turns, deterministic safety engine, human oversight tiers")
+hero(f"Control room · AUTONOMOUS SG 2026 · Challenge #2 · three independent specialists, a Chief of Staff, max "
+     f"{MAX_TURNS} turns, deterministic safety engine, human oversight tiers", compact=True)
+fids_board(s, st.session_state.get("outcome"), running=st.session_state.get("sess") is not None,
+           pending=st.session_state.get("pending") is not None)
 m = st.columns(6)
 m[0].metric("Flight", s.flight, f"{s.origin} → {s.destination}", delta_color="off")
 m[1].metric("SIBT", s.clock(0), s.date, delta_color="off")
@@ -150,7 +151,7 @@ with tab_neg:
             agents = make_agents(model=model, effort=effort, moderator=use_moderator, models=overrides,
                                  timeout_s=float(timeout_s))
         else:
-            agents = make_rule_agents()
+            agents = make_engine_agents(kind, "", "")
         st.session_state.update(sess=NegotiationSession(s, agents, Autonomy(autonomy)), events=[], pending=None,
                                 outcome=None)
         pump()

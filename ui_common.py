@@ -9,15 +9,138 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import profiles
 from escalation import duty_phone
 from negotiation import MAX_TURNS
 from scenario import Scenario, build_scenario, load_disrupted_flights, split_of
 
 ROOT = Path(__file__).parent
-AVATARS = {"ATC": "🗼", "PILOT": "🧑‍✈️", "GROUND": "🧳", "MODERATOR": "🧭", "SYSTEM": "⚙️", "user": "👤"}
-NAMES = {"ATC": "ATC · Arrival Manager", "PILOT": "Flight Crew · Captain", "GROUND": "AOCC · Turnaround",
-         "MODERATOR": "Chief of Staff", "SYSTEM": "Safety engine"}
 STANCE = {"PROPOSE": "blue", "ACCEPT": "green", "COUNTER": "orange"}
+ENGINES = ["Claude agents", "Rule-based (free)", "Safety drill: rogue agents (free)"]
+
+
+class _Profile(dict):
+    """Live lookup into the customisable agent profiles (name or avatar)."""
+
+    def __init__(self, field: str):
+        super().__init__()
+        self.field = field
+
+    def __getitem__(self, agent):
+        p = profiles.load()
+        if self.field == "avatar":
+            return profiles.avatar_for_streamlit(agent, p)
+        return p.get(agent, {}).get("name", agent)
+
+    def get(self, agent, default=None):
+        return self[agent] if agent in profiles.load() else default
+
+
+AVATARS = _Profile("avatar")
+NAMES = _Profile("name")
+
+
+def make_engine_agents(engine: str, model: str, effort: str, **kw) -> dict:
+    from agents import make_agents
+    from baseline_agents import make_drill_agents, make_rule_agents
+    if engine.startswith("Rule"):
+        return make_rule_agents()
+    if engine.startswith("Safety drill"):
+        return make_drill_agents()
+    return make_agents(model=model, effort=effort, **kw)
+
+
+# ============================================================================
+# Airport look: theme CSS, hero banner, departure-board (FIDS) strip
+# ============================================================================
+CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500;700&family=VT323&display=swap');
+html, body, [class*="css"], .stMarkdown, .stChatMessage { font-family: 'Inter', sans-serif; }
+code, .stCode, pre { font-family: 'JetBrains Mono', monospace !important; }
+h1, h2, h3 { letter-spacing: -0.02em; font-weight: 800 !important; }
+[data-testid="stSidebar"] { background: #0A0C0E; border-right: 1px solid #1F242B; }
+[data-testid="stChatMessage"] { background: #14171C; border: 1px solid #22272F; border-radius: 16px; padding: 0.8rem 1rem; }
+[data-testid="stChatMessageAvatarCustom"] img, [data-testid="stChatMessage"] img { image-rendering: pixelated; border-radius: 10px; }
+[data-testid="stExpander"] details, [data-testid="stVerticalBlockBorderWrapper"] { border-radius: 16px !important; border-color: #22272F !important; }
+.stButton button { border-radius: 999px; font-weight: 600; }
+video { image-rendering: pixelated; border-radius: 14px; border: 1px solid #22272F; }
+.runway { height: 6px; margin: 2px 0 14px 0; border-radius: 3px;
+  background: repeating-linear-gradient(90deg, #C6F432 0 26px, transparent 26px 46px); opacity: .85; }
+.ops-title { font-family: 'VT323', monospace; font-size: 2.6rem; color: #C6F432; letter-spacing: .06em; line-height: 1; }
+.ops-sub { color: #9AA3AE; font-size: .9rem; margin-top: .3rem; }
+.fids { background: #050607; border: 1px solid #262B33; border-radius: 14px; padding: 10px 14px; margin: 6px 0 12px 0;
+  font-family: 'VT323', monospace; font-size: 1.35rem; color: #FFC233; overflow-x: auto; }
+.fids table { width: 100%; border-collapse: collapse; }
+.fids th { color: #6F7782; font-size: 1rem; text-align: left; font-weight: 400; padding: 0 10px 4px 0; letter-spacing: .08em; }
+.fids td { padding: 2px 10px 2px 0; white-space: nowrap; }
+.fids .ok { color: #C6F432; } .fids .bad { color: #FF5A4E; } .fids .busy { animation: blink 1.2s steps(2, start) infinite; }
+@keyframes blink { to { visibility: hidden; } }
+</style>
+"""
+
+
+def apply_theme() -> None:
+    st.markdown(CSS, unsafe_allow_html=True)
+
+
+def hero(subtitle: str, compact: bool = False) -> None:
+    left, right = st.columns([1, 2] if not compact else [1, 4], vertical_alignment="center")
+    video = ROOT / "assets" / "roster.mp4"
+    if video.exists():
+        left.video(str(video), autoplay=True, loop=True, muted=True)
+    right.markdown(f"<div class='ops-title'>A-CDM OPS CENTER</div><div class='ops-sub'>{subtitle}</div>",
+                   unsafe_allow_html=True)
+    st.markdown("<div class='runway'></div>", unsafe_allow_html=True)
+
+
+def fids_board(s: Scenario, outcome=None, running: bool = False, pending: bool = False) -> None:
+    """Departure-board style status strip for the active flight."""
+    p = outcome.proposal if outcome else None
+    if outcome is None:
+        status, cls = (("AWAITING OPS", "busy") if pending else ("NEGOTIATING", "busy") if running
+                       else (f"DELAYED +{s.late_aircraft_delay_min + s.weather_delay_min}", ""))
+    elif p.runway == "DIVERT":
+        status, cls = f"DIVERTED {p.gate}", "bad"
+    else:
+        status, cls = {"CONSENSUS": ("PLAN AGREED", "ok"), "FALLBACK": ("SOP PLAN", "bad"),
+                       "HUMAN_DECISION": ("OPS DECISION", "ok")}[outcome.status]
+    tldt = s.clock(p.landing_slot_min) if p is not None and p.runway != "DIVERT" else "--:--"
+    rwy = p.runway if p is not None and p.runway != "DIVERT" else "---"
+    stand = p.gate if p is not None and p.runway != "DIVERT" else "---"
+    st.markdown(
+        "<div class='fids'><table><tr><th>FLIGHT</th><th>FROM</th><th>TO</th><th>SIBT</th><th>ELDT</th><th>TLDT</th>"
+        "<th>RWY</th><th>STAND</th><th>REMARKS</th></tr>"
+        f"<tr><td>{s.flight}</td><td>{s.origin}</td><td>{s.destination}</td><td>{s.clock(0)}</td>"
+        f"<td>{s.clock(s.eta_min)}</td><td>{tldt}</td><td>{rwy}</td><td>{stand}</td>"
+        f"<td class='{cls}'>{status}</td></tr></table></div>", unsafe_allow_html=True)
+
+
+@st.dialog("🎨 Customise your agents", width="large")
+def customise_dialog() -> None:
+    p = profiles.load()
+    tabs = st.tabs([p[a]["name"] for a in ("MODERATOR", "ATC", "PILOT", "GROUND")])
+    for tab, agent in zip(tabs, ("MODERATOR", "ATC", "PILOT", "GROUND")):
+        with tab:
+            c1, c2 = st.columns([1, 3])
+            av = profiles.avatar_for_streamlit(agent, p)
+            if av.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                c1.image(av, width=96)
+            else:
+                c1.markdown(f"<div style='font-size:64px'>{av}</div>", unsafe_allow_html=True)
+            name = c2.text_input("Display name", p[agent]["name"], key=f"cz_name_{agent}")
+            emoji = c2.text_input("Emoji avatar (optional)", "", key=f"cz_emoji_{agent}", placeholder="e.g. 🛫")
+            up = c2.file_uploader("…or upload an image / GIF", type=["png", "jpg", "jpeg", "gif", "webp"],
+                                  key=f"cz_up_{agent}")
+            b1, b2 = c2.columns(2)
+            if b1.button("Save", key=f"cz_save_{agent}", type="primary"):
+                profiles.save(agent, name=name, avatar=emoji.strip() or None,
+                              image_bytes=up.getvalue() if up else None,
+                              ext=(up.name.rsplit(".", 1)[-1].lower() if up else "png"))
+                st.rerun()
+            if b2.button("Reset to default", key=f"cz_reset_{agent}"):
+                profiles.reset(agent)
+                st.rerun()
 
 
 @st.cache_data(show_spinner="Loading DOT flights…")

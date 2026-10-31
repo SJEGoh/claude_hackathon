@@ -11,7 +11,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, create_model
 
-from agents.base import BaseAgent, ConstraintClaim, reply_schema  # noqa: F401
+from agents.base import SAFETY_CHARTER, BaseAgent, ConstraintClaim, reply_schema  # noqa: F401
 from constraints import Proposal
 from monitoring import CallMetric
 from scenario import Scenario
@@ -67,7 +67,7 @@ class ModeratorAgent(BaseAgent):
                 "allow one, and give each specialist a directive for the next turn.")
         content = (f"## Public disruption facts\n{self.public_brief(s)}\n\n## Public bus\n{bus or '(empty)'}"
                    f"\n\n## Task\n{task}")
-        reply, metric = self._call(content, _moderator_schema(s), turn, system=self.role)
+        reply, metric = self._call(content, _moderator_schema(s), turn, system=f"{self.role}\n\n{SAFETY_CHARTER}")
         data = reply.model_dump()
         return ModeratorMessage(**data, turn=turn, metric=metric)
 
