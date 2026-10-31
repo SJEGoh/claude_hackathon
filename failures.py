@@ -84,7 +84,7 @@ def load_runs() -> list[Run]:
         if f.name.startswith(("chat_", "EMERGENCY_")):
             continue
         try:
-            rows = [json.loads(line) for line in f.read_text().splitlines() if line.strip()]
+            rows = [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines() if line.strip()]
         except (OSError, json.JSONDecodeError):
             continue
         scen = next((r["payload"] for r in rows if r["kind"] == "scenario"), None)
