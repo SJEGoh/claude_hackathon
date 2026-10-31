@@ -2,10 +2,9 @@
 from __future__ import annotations
 
 from agents.base import BaseAgent
-from constraints import Domain
 import ops_settings
-from constraints import turnaround
-from scenario import Scenario
+from constraints import Domain
+from scenario import LIMITS, MODELLED_STANDS, Scenario
 
 
 class GroundAgent(BaseAgent):
@@ -13,7 +12,7 @@ class GroundAgent(BaseAgent):
     title = "AOCC: Turnaround Coordinator"
     role = ("You are the AOCC turnaround coordinator. Mandate under A-CDM: stand allocation (size and "
             "availability for the whole turnaround), in-block time (EIBT), the next leg's Target Off-Block Time "
-            "(TOBT), ground-crew duty limits and overtime, and ramp safety (handling stops during lightning). "
+            "(TOBT), gate-change notice, ground-crew overtime, and ramp safety (handling stops during lightning). "
             "Minimise turnaround delay and knock-on delay to the next departure.")
 
     def private_brief(self, s: Scenario) -> str:
@@ -22,18 +21,26 @@ class GroundAgent(BaseAgent):
             f"{'now' if g.free_from <= -999 else f'{s.clock(g.free_from)} (slot {g.free_from})'} until "
             f"{'open' if g.free_until >= 10_000 else f'{s.clock(g.free_until)} (slot {g.free_until})'}"
             for g in s.gates)
-        nl, cfg = s.next_leg, ops_settings.get()
+        nl = s.next_leg
         next_leg = (f"Next leg {nl.flight} to {nl.destination}: TOBT {s.clock(nl.tobt)} (slot {nl.tobt})"
                     + (" [DOT schedule]" if nl.source == "DOT" else " [simulated]")) if nl else "No next leg."
+        cap = s.airport_limits
+        earliest_change = s.decision_time_min + LIMITS.gate_change_notice_min
         return "\n".join([
+            f"{s.destination} is a {cap.size_class}: {cap.gates} gates ({min(cap.gates, MODELLED_STANDS)} modelled plus "
+            f"remote bay R1), {cap.spare_gates} spare at any time, minimum turnaround {cap.min_turnaround_min} min.",
             f"{s.flight} {s.aircraft_type}: needs a {'wide-body' if s.wake == 'HEAVY' else 'any'} stand. "
             f"Scheduled stand {s.scheduled_gate}. SIBT {s.clock(0)}.",
-            f"Turnaround {turnaround(s)} min from in-block (ramp staffing {cfg.ramp_staffing_pct}%)"
+            f"Turnaround {s.turnaround_min} min from in-block"
             + (" (includes de-icing: freezing precipitation/snow)." if s.deice_required else "."),
+            ops_settings.ground_note(s.turnaround_min),
             next_leg,
-            f"Crew shift ends {s.clock(s.crew_shift_end_min)} (slot {s.crew_shift_end_min}); overtime allowed up to "
-            f"{cfg.max_crew_overtime_min} min (legal cap, hard) but costs money."
-            + ("" if cfg.allow_remote_stands else " Remote stands are DISABLED by policy (hard)."),
+            f"Gate change: at least {LIMITS.gate_change_notice_min} min notice before arrival (hard). The negotiation "
+            f"opened at {s.clock(s.decision_time_min)}, so any stand other than {s.scheduled_gate} needs TLDT "
+            f"{s.clock(earliest_change)} (slot {earliest_change}) or later.",
+            f"{LIMITS.ground_shift_h} h crew shift ends {s.clock(s.crew_shift_end_min)} (slot {s.crew_shift_end_min}), "
+            f"then the next shift takes over; a turnaround running past a shift change is overtime at "
+            f"{LIMITS.overtime_multiplier}x (a cost, not a hard limit).",
             (f"RAMP CLOSED (lightning) until {s.clock(s.ramp_closed_until)} (slot {s.ramp_closed_until}): "
              "turnaround cannot start before." if s.ramp_closed_until > -999 else "Ramp open."),
             "Taxi-in by runway -> terminal (min); EIBT = TLDT + taxi: "

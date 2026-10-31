@@ -12,7 +12,11 @@ from pydantic import BaseModel
 
 import costs
 import ops_settings
-from scenario import WAKE_SEPARATION_MIN, Runway, Scenario
+from scenario import (
+    IMC_EXTRA_SPACING_MIN, LIMITS, MIN_CONNECT_TIME_MIN, MIN_FUEL_ADVISORY_MARGIN_MIN, SEVERE_HOLD_LIMIT_MIN,
+    WAKE_ABBR, WAKE_SEPARATION_MIN, Scenario,
+)
+from weather import MAX_CROSSWIND_KT, MAX_TAILWIND_KT
 
 Domain = Literal["ATC", "PILOT", "GROUND"]
 
@@ -47,17 +51,6 @@ class DomainReport(BaseModel):
         return [c for c in self.checks if not c.hard and not c.passed]
 
 
-def runway_usable(r: Runway) -> bool:
-    """Wind inside the (runway-condition-adjusted) limits and braking action not nil. Read live from Ops settings."""
-    cfg = ops_settings.get()
-    return (r.wind_within_limits and r.crosswind_kt <= cfg.crosswind_limit() and r.tailwind_kt <= cfg.max_tailwind_kt
-            and not cfg.runway_closed_by_condition())
-
-
-def turnaround(s: Scenario) -> int:
-    return ops_settings.get().turnaround(s.turnaround_min)
-
-
 def on_block(s: Scenario, p: Proposal) -> Optional[int]:
     gate, rwy = s.gate(p.gate), s.runway(p.runway)
     if gate is None or rwy is None:
@@ -69,8 +62,23 @@ def on_block(s: Scenario, p: Proposal) -> Optional[int]:
 # Domain validators
 # ============================================================================
 
-def check_atc(s: Scenario, p: Proposal) -> DomainReport:
+def runway_condition_ok(r) -> bool:
+    """Ops-settings layer on top of the workbook limits: runway condition (RWYCC) and any stricter wind caps."""
     cfg = ops_settings.get()
+    return (not cfg.runway_closed_by_condition() and r.crosswind_kt <= cfg.crosswind_limit()
+            and r.tailwind_kt <= cfg.max_tailwind_kt)
+
+
+def runway_usable(r) -> bool:
+    return r.wind_within_limits and runway_condition_ok(r)
+
+
+def ramp_extra_min(s: Scenario) -> int:
+    """Ops-settings layer: extra turnaround minutes when the ramp is short-staffed."""
+    return ops_settings.get().turnaround(s.turnaround_min) - s.turnaround_min
+
+
+def check_atc(s: Scenario, p: Proposal) -> DomainReport:
     rwy = s.runway(p.runway)
     if rwy is None:
         return DomainReport(domain="ATC", metrics={}, checks=[Check(
@@ -81,12 +89,16 @@ def check_atc(s: Scenario, p: Proposal) -> DomainReport:
         Check(domain="ATC", name="runway_open", hard=True, passed=p.landing_slot_min >= rwy.closed_until,
               detail=f"{rwy.id} {rwy.closure_reason}" + (f" until {s.clock(rwy.closed_until)}"
                                                          if rwy.closed_until > -999 else "")),
-        Check(domain="ATC", name="runway_wind_limits", hard=True, passed=runway_usable(rwy),
-              detail=f"{rwy.id} crosswind {rwy.crosswind_kt} kt (max {cfg.crosswind_limit():.0f} at RWYCC {cfg.rwycc}), "
-                     f"tailwind {rwy.tailwind_kt} kt (max {cfg.max_tailwind_kt:.0f})"
-                     + (" · RWYCC 0: runway closed" if cfg.runway_closed_by_condition() else "")),
+        Check(domain="ATC", name="runway_wind_limits", hard=True, passed=rwy.wind_within_limits,
+              detail=f"{rwy.id} crosswind {rwy.crosswind_kt} kt (max {MAX_CROSSWIND_KT}), tailwind "
+                     f"{rwy.tailwind_kt} kt (max {MAX_TAILWIND_KT})"),
+        Check(domain="ATC", name="runway_condition", hard=True, passed=runway_condition_ok(rwy),
+              detail=f"Ops settings: RWYCC {ops_settings.get().rwycc}, crosswind cap "
+                     f"{ops_settings.get().crosswind_limit():.0f} kt, tailwind cap {ops_settings.get().max_tailwind_kt:.0f} kt"
+                     + (" (nil braking: runway closed)" if ops_settings.get().runway_closed_by_condition() else "")),
     ]
-    extra = cfg.extra_spacing(s.imc)
+    extra = IMC_EXTRA_SPACING_MIN if s.imc else 0
+    extra += ops_settings.get().extra_spacing_beyond_workbook()  # Ops settings: approach mode, runway condition
     conflicts = []
     for other in rwy.traffic:
         if other.t <= p.landing_slot_min:
@@ -94,43 +106,53 @@ def check_atc(s: Scenario, p: Proposal) -> DomainReport:
         else:
             need, gap = WAKE_SEPARATION_MIN[(s.wake, other.wake)] + extra, other.t - p.landing_slot_min
         if gap < need:
-            conflicts.append(f"{other.callsign}({other.wake[0]}) at {s.clock(other.t)}: {gap} < {need} min")
+            conflicts.append(f"{other.callsign}({WAKE_ABBR[other.wake]}) at {s.clock(other.t)}: {gap} < {need} min")
     checks.append(Check(domain="ATC", name="wake_separation", hard=True, passed=not conflicts,
-                        detail="; ".join(conflicts) or f"all gaps meet wake minima{f' (+{extra} min approach/runway condition)' if extra else ''}"))
+                        detail="; ".join(conflicts) or f"all gaps meet wake minima{' (+1 min IMC)' if extra else ''}"))
+    # Only arrivals are modelled, so this can only under-count the airport's hourly movements.
+    arrivals_in_hour = 1 + sum(1 for r in s.runways for t in r.traffic if abs(t.t - p.landing_slot_min) < 30)
+    max_ops = s.airport_limits.max_runway_ops_per_hour
+    checks.append(Check(domain="ATC", name="runway_capacity", hard=True, passed=arrivals_in_hour <= max_ops,
+                        detail=f"{arrivals_in_hour} arrivals in the hour around TLDT (max {max_ops} ops/h)"))
     gate = s.gate(p.gate)
     if gate is not None:
         taxi = rwy.taxi_min[gate.terminal]
         checks.append(Check(domain="ATC", name="taxi_route", hard=False, passed=taxi <= 12,
                             detail=f"{rwy.id} -> Terminal {gate.terminal}: {taxi} min"))
     load = sum(1 for t in rwy.traffic if abs(t.t - p.landing_slot_min) <= 15)
-    return DomainReport(domain="ATC", checks=checks, metrics={"runway_movements_within_15min": load})
+    return DomainReport(domain="ATC", checks=checks, metrics={"runway_movements_within_15min": load,
+                                                              "arrivals_in_hour": arrivals_in_hour})
 
 
 def check_pilot(s: Scenario, p: Proposal) -> DomainReport:
-    cfg = ops_settings.get()
     holding = max(0, p.landing_slot_min - s.eta_min)
     efob = s.fuel_at(p.landing_slot_min)
     margin_min = (efob - s.min_landing_fuel_kg) / s.hold_burn_kg_per_min
     checks = [
         Check(domain="PILOT", name="fuel_reserve", hard=True, passed=efob >= s.min_landing_fuel_kg,
-              detail=f"EFOB {efob} kg vs FRF+ALTN {s.min_landing_fuel_kg} kg ({margin_min:+.0f} min)"),
+              detail=f"EFOB {efob} kg vs FRF+ALTN+contingency {s.min_landing_fuel_kg} kg ({margin_min:+.0f} min)"),
         Check(domain="PILOT", name="minimum_fuel_advisory", hard=False,
-              passed=margin_min >= cfg.min_fuel_advisory_margin_min,
-              detail=f"{margin_min:.0f} min above FRF+ALTN (MINIMUM FUEL inside {cfg.min_fuel_advisory_margin_min})"),
+              passed=margin_min >= MIN_FUEL_ADVISORY_MARGIN_MIN,
+              detail=f"{margin_min:.0f} min above FRF+ALTN+contingency (MINIMUM FUEL inside "
+                     f"{MIN_FUEL_ADVISORY_MARGIN_MIN})"),
     ]
     wx = s.weather
     turb, ice = (wx.hold_turbulence, wx.hold_icing) if wx else ("NONE", "NONE")
     severe = "SEV" in (turb, ice)
     checks.append(Check(domain="PILOT", name="holding_environment", hard=severe,
-                        passed=(holding <= cfg.severe_hold_limit_min) if severe else (holding == 0 or "MOD" not in (turb, ice)),
+                        passed=(holding <= SEVERE_HOLD_LIMIT_MIN) if severe else (holding == 0 or "MOD" not in (turb, ice)),
                         detail=f"{holding} min holding; PIREPs turbulence {turb}, icing {ice}"
-                               + (f" (max {cfg.severe_hold_limit_min} min in SEV)" if severe else "")))
+                               + (f" (max {SEVERE_HOLD_LIMIT_MIN} min in SEV)" if severe else "")))
     rwy = s.runway(p.runway)
     if rwy:
         checks.append(Check(domain="PILOT", name="approach_crosswind", hard=False, passed=rwy.crosswind_kt <= 20,
                             detail=f"{rwy.id} crosswind {rwy.crosswind_kt} kt"))
     ob = on_block(s, p)
-    missed = [c for c in s.connections if ob is None or ob + cfg.min_connect_time_min > c.departs_at]
+    if ob is not None:
+        checks.append(Check(domain="PILOT", name="flight_crew_duty", hard=True, passed=ob <= s.flight_duty_end_min,
+                            detail=f"EIBT {s.clock(ob)}, {LIMITS.flight_crew_max_duty_h} h duty ends "
+                                   f"{s.clock(s.flight_duty_end_min)}"))
+    missed = [c for c in s.connections if ob is None or ob + MIN_CONNECT_TIME_MIN > c.departs_at]
     checks.append(Check(domain="PILOT", name="passenger_connections", hard=False, passed=not missed,
                         detail=", ".join(f"{c.flight} to {c.destination} ({c.pax} pax)" for c in missed)
                         or (f"{len(s.connections)} connections protected" if s.connections else "no tracked connections")))
@@ -148,10 +170,12 @@ def check_ground(s: Scenario, p: Proposal) -> DomainReport:
         return DomainReport(domain="GROUND", metrics={}, checks=[Check(
             domain="GROUND", name="gate_exists", passed=False, hard=True, detail=f"Stand {p.gate} unknown")])
     start = max(ob, s.ramp_closed_until)
-    cfg = ops_settings.get()
-    end = start + turnaround(s)
-    overtime = max(0, end - s.crew_shift_end_min)
+    end = start + s.turnaround_min
+    end += ramp_extra_min(s)  # Ops settings: ramp staffing
+    shift_end = s.shift_end_at(start)
+    overtime = max(0, end - shift_end)
     tobt_delay = max(0, end - s.next_leg.tobt) if s.next_leg else 0
+    notice = p.landing_slot_min - s.decision_time_min
     checks = [
         Check(domain="GROUND", name="stand_size", hard=True, passed=gate.widebody or s.wake != "HEAVY",
               detail=f"{gate.id} {'wide' if gate.widebody else 'narrow'}-body stand, aircraft {s.aircraft_type}"),
@@ -160,16 +184,19 @@ def check_ground(s: Scenario, p: Proposal) -> DomainReport:
         Check(domain="GROUND", name="stand_free_for_turnaround", hard=True, passed=end <= gate.free_until,
               detail=f"turnaround ends {s.clock(end)}, next user of {gate.id} at "
                      f"{s.clock(gate.free_until) if gate.free_until < 10_000 else 'none'}"),
-        Check(domain="GROUND", name="crew_duty_limit", hard=True, passed=overtime <= cfg.max_crew_overtime_min,
-              detail=f"overtime {overtime} min (legal cap {cfg.max_crew_overtime_min})"),
+        Check(domain="GROUND", name="gate_change_notice", hard=True,
+              passed=p.gate == s.scheduled_gate or notice >= LIMITS.gate_change_notice_min,
+              detail=(f"stand {p.gate} is the scheduled stand" if p.gate == s.scheduled_gate else
+                      f"change from {s.scheduled_gate} notified {notice} min before arrival "
+                      f"(min {LIMITS.gate_change_notice_min})")),
         Check(domain="GROUND", name="crew_overtime", hard=False, passed=overtime == 0,
-              detail=f"shift ends {s.clock(s.crew_shift_end_min)}, turnaround ends {s.clock(end)}"),
+              detail=f"shift ends {s.clock(shift_end)}, turnaround ends {s.clock(end)}; overtime {overtime} min "
+                     f"at {LIMITS.overtime_multiplier}x"),
         Check(domain="GROUND", name="next_leg_tobt", hard=False, passed=tobt_delay == 0,
               detail=(f"{s.next_leg.flight} TOBT {s.clock(s.next_leg.tobt)}: {tobt_delay} min knock-on delay"
                       if s.next_leg else "no next leg")),
-        Check(domain="GROUND", name="contact_stand", hard=not cfg.allow_remote_stands, passed=not gate.remote,
-              detail=("remote stand: bussing" + ("" if cfg.allow_remote_stands else " (remote stands disabled in Ops settings)"))
-              if gate.remote else "contact stand"),
+        Check(domain="GROUND", name="contact_stand", hard=False, passed=not gate.remote,
+              detail="remote stand: bussing" if gate.remote else "contact stand"),
     ]
     if s.ramp_closed_until > -999:
         checks.append(Check(domain="GROUND", name="ramp_lightning_hold", hard=False, passed=ob >= s.ramp_closed_until,
@@ -256,14 +283,16 @@ def deterministic_plan(s: Scenario, horizon_min: int = 180, k: int = 4) -> Fallb
                 break
         return FallbackResult(proposal=found[0][1], mode="OPTIMISED_SOP", cost=found[0][0], alternatives=alts,
                               reason="Least-cost plan satisfying every hard constraint (exhaustive search).")
-    usable = [r for r in s.runways if runway_usable(r)] or s.runways
+    usable = [r for r in s.runways if r.wind_within_limits] or s.runways
     rwy = min(usable, key=lambda r: max(r.closed_until, s.eta_min))
     slot = max(rwy.closed_until, s.eta_min)
     p = Proposal(landing_slot_min=slot, runway=rwy.id, gate="R1")
-    if runway_usable(rwy) and check_pilot(s, p).hard_ok:
+    # A crew running out of duty is no reason to divert: the fuel and weather limits decide that.
+    must_divert = [c for c in check_pilot(s, p).violations() if c.name != "flight_crew_duty"]
+    if rwy.wind_within_limits and not must_divert:
         return FallbackResult(proposal=p, mode="FUEL_PRIORITY", cost=None,
                               reason=f"No conflict-free plan exists. Fuel priority: ATC re-sequences traffic on "
                                      f"{rwy.id}, aircraft parks on remote stand R1.")
     return FallbackResult(proposal=Proposal(landing_slot_min=s.eta_min, runway="DIVERT", gate=s.alternate),
                           mode="DIVERT", cost=None,
-                          reason=f"FRF+ALTN cannot be protected at {s.destination}: divert to {s.alternate}.")
+                          reason=f"FRF+ALTN+contingency cannot be protected at {s.destination}: divert to {s.alternate}.")

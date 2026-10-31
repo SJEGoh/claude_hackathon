@@ -9,7 +9,7 @@ import argparse
 
 from agents import DEFAULT_MODEL, make_agents, render_brief, render_message
 from baseline_agents import make_rule_agents
-from negotiation import Autonomy, DecisionRequest, negotiate
+from negotiation import STAKEHOLDERS, Autonomy, DecisionRequest, RatificationRequest, negotiate, render_positions
 from scenario import build_scenario, load_disrupted_flights
 
 
@@ -21,6 +21,24 @@ def ask_terminal(req: DecisionRequest) -> str:
         print(f"  {i}. {o.label}: {o.description}")
     raw = input(f"Choose 1-{len(req.options)} [default: {req.default}]: ").strip()
     return req.options[int(raw) - 1].id if raw.isdigit() and 1 <= int(raw) <= len(req.options) else req.default
+
+
+def show_ratification(req: RatificationRequest) -> None:
+    print(f"\n*** CHIEF OF STAFF: plan #{req.plan_id} (round {req.round}) needs ratifying: {req.plan_text}")
+    if req.chief_summary:
+        print(f"    {req.chief_summary}\n    Reasoning: {req.chief_reasoning}")
+    for line in req.facts + req.risks:
+        print(f"    - {line}")
+    print(render_positions(req.positions))
+
+
+def ask_votes(req: RatificationRequest) -> dict:
+    answers = {}
+    for agent in STAKEHOLDERS:
+        agree = input(f"{agent}: agree? [y/n]: ").strip().lower() == "y"
+        reason = "" if agree else input(f"{agent}: reason for disagreeing: ").strip()
+        answers[agent] = {"agree": agree, "reason": reason}
+    return answers
 
 
 def main() -> None:
@@ -40,7 +58,11 @@ def main() -> None:
 
     def on_event(kind, data):
         if kind == "turn":
-            print(f"\n===== TURN {data['turn']} =====")
+            print(f"\n===== ROUND {data['round']} TURN {data['round_turn']} =====")
+        elif kind in ("ratification", "ratification_request"):
+            show_ratification(data)
+        elif kind == "vote":
+            print(f"  {data.agent} ({data.by}) {'AGREE' if data.agree else 'DISAGREE'}: {data.reason}")
         elif kind == "message":
             print(render_message(data, s))
         elif kind == "brief":
@@ -56,9 +78,9 @@ def main() -> None:
 
     agents = (make_rule_agents() if args.agents == "rules" else
               make_agents(model=args.model, effort=args.effort, moderator=not args.no_moderator))
-    out = negotiate(s, agents, on_event, autonomy=Autonomy(args.autonomy), decide=ask_terminal)
+    out = negotiate(s, agents, on_event, autonomy=Autonomy(args.autonomy), decide=ask_terminal, ratify=ask_votes)
     p = out.proposal
-    print(f"\nRESULT: {out.status} ({out.plan_source}) after {out.turns_used} turn(s): TLDT {s.clock(p.landing_slot_min)} "
+    print(f"\nRESULT: {out.status} ({out.plan_source}) after {out.turns_used} turn(s) in {out.rounds} round(s): TLDT {s.clock(p.landing_slot_min)} "
           f"(slot {p.landing_slot_min}) RWY {p.runway}, stand {p.gate}")
     print(f"cost {out.cost} vs deterministic optimum {out.reference.cost} | {out.elapsed_s}s | "
           f"${out.usage['cost_usd']} ({out.usage['input_tokens']}+{out.usage['output_tokens']} tok) | "

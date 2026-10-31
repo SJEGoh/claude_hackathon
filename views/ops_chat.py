@@ -23,8 +23,8 @@ from emergency import KIND_LABEL, plan_emergency, readbacks
 from escalation import Alarm, dispatch
 from negotiation import Autonomy, ConsensusLog, NegotiationSession
 from scenario import load_disrupted_flights
-from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, get_scenario, hero, make_engine_agents, render_emergency,
-                       render_event, render_outcome, timeline)
+from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, get_scenario, hero, make_engine_agents,
+                       ratification_form, render_emergency, render_event, render_outcome, timeline)
 
 CHANNELS = ["group", "MODERATOR", "ATC", "PILOT", "GROUND"]
 LABEL = {"group": "👥 #ops-team", "MODERATOR": "✉️ Chief of Staff", "ATC": "✉️ ATC", "PILOT": "✉️ Flight Crew",
@@ -43,6 +43,8 @@ S.setdefault("oc_group_log", [])
 S.setdefault("oc_scenario", None)
 S.setdefault("oc_session", None)
 S.setdefault("oc_pending", None)
+S.setdefault("oc_ratify", None)
+S.setdefault("oc_votes", None)
 S.setdefault("oc_outcome", None)
 S.setdefault("oc_metrics", [])
 S.setdefault("oc_click", None)
@@ -173,12 +175,12 @@ INTROS = {
             "separation**, runway closures and crosswind/tailwind limits, **taxiway blockages**, and **maximising "
             "arrival throughput**. I can test any landing slot against separation and list conflict-free AMAN "
             "slots. Fuel and passengers are the Captain's; stands and crew are AOCC's, and I'll hand those over."),
-    "PILOT": ("**{name}**, flight deck. I **preserve fuel reserves** (never below final reserve plus alternate), "
-              "keep the flight safe, **minimise time in turbulence and icing** using PIREPs, and **protect "
+    "PILOT": ("**{name}**, flight deck. I **preserve fuel reserves** (never below final reserve plus alternate and "
+              "contingency), stay inside crew duty limits, keep the flight safe, **minimise time in turbulence and icing** using PIREPs, and **protect "
               "passengers' connections**. I can give you FMS fuel predictions for any landing time and check a plan "
               "against my limits. Runway sequencing is ATC's; stands are AOCC's."),
     "GROUND": ("**{name}**, Airport Operations Control Centre. I **optimise stand utilisation**, keep **ground crew "
-               "out of overtime** and inside the legal duty cap, and **minimise turnaround delay** and knock-on to "
+               "out of overtime**, give proper gate-change notice, and **minimise turnaround delay** and knock-on to "
                "the next departure. I can check any plan against stand, crew and turnaround limits. Landing times "
                "are ATC's; fuel is the Captain's."),
 }
@@ -235,6 +237,9 @@ def context_for(agent: str, c: Conversation) -> str:
         parts.append("## Recent #ops-team activity (for awareness)\n" + "\n".join(new[-30:]))
     elif new:
         parts.append("## New in #ops-team since your last message\n" + "\n".join(new[-40:]))
+    if agent == "MODERATOR" and S.oc_ratify is not None:
+        parts.append(f"## WAITING FOR STAKEHOLDER VOTES on plan #{S.oc_ratify.plan_id}: the controller, pilot and ground "
+                     "lead vote on the card in #ops-team. You cannot vote for them.")
     if agent == "MODERATOR" and S.oc_pending is not None:
         req = S.oc_pending
         parts.append(f"## PENDING DECISION ({req.code}): {req.title}\n" + "\n".join(req.briefing) + "\nOptions: "
@@ -308,6 +313,7 @@ def t_find_flights(destination_airport: str, bucket: str, min_weather_delay: int
 def t_load_flight(row_id: int, weather_mode: str) -> str:
     s = get_scenario(row_id, weather_mode)
     S.oc_scenario, S.oc_session, S.oc_pending, S.oc_outcome, S.oc_emergency = s, None, None, None, None
+    S.oc_ratify = None
     post("group", {"t": "note", "text": f"📂 Active flight: **{s.flight}** {s.origin}→{s.destination} {s.date}, "
                                         f"SIBT {s.clock(0)} · WX {s.weather_delay_min} · LATE {s.late_aircraft_delay_min} "
                                         f"· weather {weather_mode.lower()}"},
@@ -319,7 +325,8 @@ def t_flight_status() -> str:
     s = scenario()
     if s is None:
         return "No flight loaded."
-    state = ("paused for a decision: " + S.oc_pending.title if S.oc_pending else
+    state = (f"waiting for stakeholder votes on plan #{S.oc_ratify.plan_id}" if S.oc_ratify else
+             "paused for a decision: " + S.oc_pending.title if S.oc_pending else
              f"finished: {S.oc_outcome.status}" if S.oc_outcome else
              "running" if S.oc_session else "not started")
     return AGENT_OBJECTS["MODERATOR"].public_brief(s) + f"\nNegotiation: {state}."
@@ -340,12 +347,23 @@ def pump(choice=None) -> str:
         elif kind != "metric":
             line = {"message": lambda: render_message(data, s), "brief": lambda: render_brief(data),
                     "system": lambda: f"SYSTEM {data['kind']}: {data['text']}",
-                    "alarm": lambda: f"ALARM {data.code}: {data.title}"}.get(kind, lambda: None)()
+                    "alarm": lambda: f"ALARM {data.code}: {data.title}",
+                    "ratification": lambda: f"CHIEF OF STAFF to stakeholders: ratify plan #{data.plan_id}, {data.plan_text}",
+                    "ratification_request": lambda: f"CHIEF OF STAFF to stakeholders: ratify plan #{data.plan_id}, {data.plan_text}",
+                    "vote": lambda: f"{data.agent} ({data.by}) {'AGREE' if data.agree else 'DISAGREE'}: {data.reason}",
+                    }.get(kind, lambda: None)()
             if kind == "message":
                 show_status(data.agent, "idle")
             if kind == "brief":
                 show_status("MODERATOR", "idle")
             post("group", {"t": "event", "kind": kind, "data": data, "live": True}, log_line=line)
+        if kind == "ratification":
+            S.oc_ratify = data
+            for a in ("ATC", "PILOT", "GROUND"):
+                show_status(a, "idle")
+            show_status("MODERATOR", "waiting")
+            return (f"PAUSED for stakeholder votes on plan #{data.plan_id}: {data.plan_text}. The controller, pilot and "
+                    "ground lead vote on the card in #ops-team; you cannot vote for them. Tell the duty officer so.")
         if kind == "decision":
             S.oc_pending = data
             for a in ("ATC", "PILOT", "GROUND"):
@@ -354,7 +372,7 @@ def pump(choice=None) -> str:
             return (f"PAUSED for the duty officer: {data.title}. " + " ".join(data.briefing) + " Options: "
                     + "; ".join(f"{o.id} = {o.label}: {o.description}" for o in data.options))
         if kind == "outcome":
-            S.oc_pending, S.oc_outcome = None, data
+            S.oc_pending, S.oc_ratify, S.oc_outcome = None, None, data
             post("group", {"t": "outcome", "data": data},
                  log_line=f"OUTCOME {data.status} ({data.plan_source}) turn {data.turns_used}: "
                           f"{render_plan(data.proposal)}")
@@ -375,8 +393,8 @@ def t_start_negotiation(autonomy: str) -> str:
     s = scenario()
     if s is None:
         return "No flight loaded. Use find_flights and load_flight first."
-    if S.oc_pending is not None:
-        return "A negotiation is already paused for a decision; resolve it first."
+    if S.oc_pending is not None or S.oc_ratify is not None:
+        return "A negotiation is already paused for a decision or stakeholder votes; finish that first."
     agents = make_engine_agents(engine, model, effort)
     S.oc_session = NegotiationSession(s, agents, Autonomy(autonomy))
     S.oc_outcome = None
@@ -440,7 +458,7 @@ def fire_emergency(kind: str, reason: str = "", by: str = "duty officer") -> str
     if S.oc_session is not None and S.oc_outcome is None:
         post("group", {"t": "note", "text": "⛔ Negotiation aborted: emergency declared."},
              log_line="SYSTEM: negotiation aborted by emergency")
-    S.oc_session, S.oc_pending, S.oc_emergency = None, None, plan
+    S.oc_session, S.oc_pending, S.oc_ratify, S.oc_emergency = None, None, None, plan
     alarm = dispatch(Alarm(code="MAYDAY", severity="ALARM", title=f"{KIND_LABEL[kind]} {s.flight}",
                            detail=(f"Divert {plan.divert_to}" if plan.divert_to else
                                    f"RWY {plan.proposal.runway} {plan.landing_clock}, stand {plan.proposal.gate}")
@@ -489,7 +507,7 @@ hero("Ops chat · talk to your AI operations team. Group chat in #ops-team, priv
      compact=True)
 if s is not None:
     fids_board(s, S.oc_outcome, emergency=S.oc_emergency, running=S.oc_session is not None and S.oc_outcome is None,
-               pending=S.oc_pending is not None)
+               pending=S.oc_pending is not None or S.oc_ratify is not None)
 if channel == "group":
     st.subheader("👥 #ops-team")
     st.caption("You, the Chief of Staff and the three specialists. Messages go to the Chief unless you @mention "
@@ -512,6 +530,21 @@ elif not S.oc_items["group"]:
 
 for item in S.oc_items[channel]:
     draw(item)
+
+# Stakeholder votes on an agreed plan (actionable in #ops-team; flagged everywhere)
+if S.oc_ratify is not None:
+    if channel == "group":
+        votes = ratification_form(S.oc_ratify, "oc_ratify")
+        if votes is not None:
+            S.oc_votes, S.oc_ratify = votes, None
+            st.rerun()
+    else:
+        st.warning(f"🔴 Stakeholder votes are waiting in #ops-team: plan #{S.oc_ratify.plan_id}")
+
+if S.oc_votes is not None:
+    votes, S.oc_votes = S.oc_votes, None
+    pump(votes)
+    st.rerun()
 
 # Pending decision card (actionable in #ops-team; flagged everywhere)
 req = S.oc_pending

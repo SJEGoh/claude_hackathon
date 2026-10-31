@@ -1,4 +1,4 @@
-"""Agent-oriented EDA of the three challenge CSVs.
+"""Agent-oriented EDA of the challenge flights file.
 
 Produces:
   eda/EDA_REPORT.md      findings, organised by which agent each one informs
@@ -19,6 +19,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
+from limits import load_limits  # noqa: E402
+
 ROOT = Path(__file__).parent
 OUT = ROOT / "eda"
 FIG = OUT / "figures"
@@ -33,10 +35,9 @@ def hhmm_to_min(s: pd.Series) -> pd.Series:
     return (s // 100) % 24 * 60 + s % 100
 
 
-def load() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    flights = pd.read_csv(ROOT / "flights.csv", low_memory=False,
-                          dtype={"ORIGIN_AIRPORT": str, "DESTINATION_AIRPORT": str})
-    return flights, pd.read_csv(ROOT / "airports.csv"), pd.read_csv(ROOT / "airlines.csv")
+def load() -> pd.DataFrame:
+    return pd.read_csv(ROOT / "data" / "flights.csv", low_memory=False,
+                       dtype={"ORIGIN_AIRPORT": str, "DESTINATION_AIRPORT": str})
 
 
 def savefig(name: str) -> str:
@@ -52,7 +53,8 @@ def pct(x: float) -> str:
 
 
 def main() -> None:
-    f, airports, airlines = load()
+    f = load()
+    limits = load_limits()
     md: list[str] = ["# EDA: US DOT 2015 delays, viewed through the three agents\n"]
     cal: dict = {}
 
@@ -63,7 +65,7 @@ def main() -> None:
     w, l = f.WEATHER_DELAY > 15, f.LATE_AIRCRAFT_DELAY > 20
     days = f.groupby("MONTH").DAY.nunique().sum()
     scale = FULL_2015_FLIGHTS * len(months) / 12 / len(f)
-    no_coords = airports[airports.LATITUDE.isna()].IATA_CODE.tolist()
+    no_limits = sorted(set(f.DESTINATION_AIRPORT) - limits.airports.keys())
     md += [
         "## 1. What the files actually contain\n",
         f"- `flights.csv`: **{len(f):,} rows x {f.shape[1]} columns**, {f.AIRLINE.nunique()} airlines, "
@@ -77,9 +79,8 @@ def main() -> None:
         f"- Integrity: the five cause columns sum exactly to ARRIVAL_DELAY on {pct(cause_sum_ok)} of rows.",
         f"- It is roughly **1/{scale:.0f} of all 2015 flights** for those months, so raw counts here understate "
         "real airport traffic. The scenario builder scales arrival density by this factor (an estimate).",
-        f"- `airports.csv`: {len(airports)} airports; {len(no_coords)} lack coordinates: {no_coords} "
-        "(weather lookups fall back to OurAirports for these).",
-        f"- `airlines.csv`: {len(airlines)} carriers, all present in flights.csv.\n",
+        f"- `{limits.source}`: planning limits for {len(limits.airports)} airports; destinations without limits: "
+        f"{no_limits or 'none'}. Its airport figures are synthetic, scaled by the organisers from flights.csv.\n",
     ]
 
     # ------------------------------------------------------------------ disruption mix

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from agents.base import AgentMessage, ConstraintClaim
+from agents.base import AgentMessage, ConstraintClaim, StakeholderVote
 from constraints import Domain, DomainReport, Proposal, check_atc, check_ground, check_pilot
 from scenario import Scenario
 
@@ -24,6 +24,10 @@ class _Rule:
                   for c in (report.checks if report else []) if not c.passed]
         return AgentMessage(stance=stance, answering_plan=plan_ref, proposal=p, constraints=claims,
                             concession="-", rationale=why, agent=self.domain, turn=turn)
+
+    def ratify(self, s: Scenario, turn: int, plan_id: int, briefing: str, own_report: DomainReport) -> StakeholderVote:
+        why = "Within my limits." if own_report.hard_ok else "; ".join(c.detail for c in own_report.violations())
+        return StakeholderVote(agree=own_report.hard_ok, reason=why, agent=self.domain, turn=turn)
 
 
 class RuleATC(_Rule):
@@ -83,7 +87,7 @@ class RogueATC(_Rule):
         super().__init__("ATC")
 
     def act(self, s: Scenario, turn: int, bus: str, on_table, plan_id, own_report) -> AgentMessage:
-        start = s.latest_safe_landing + 3 + turn  # deliberately past FRF + ALTN, a new plan each turn
+        start = s.latest_safe_landing + 3 + turn  # deliberately past the protected reserves, a new plan each turn
         for t in range(start, start + 120):
             p = Proposal(landing_slot_min=t, runway=s.runways[0].id, gate="R1")
             if check_atc(s, p).hard_ok:

@@ -1,15 +1,29 @@
 # A-CDM Multi-Agent Disruption Negotiation (AUTONOMOUS SG 2026 · Challenge #2)
 
 Three independent Claude specialists negotiate a revised landing time, runway and stand for a disrupted
-US DOT 2015 flight, in at most 3 turns, chaired by a Chief of Staff. Plain code checks every plan, a
-deterministic planner takes over when the agents don't converge, and a human can supervise at chosen
-points.
+US DOT 2015 flight, in at most 3 turns, chaired by a Chief of Staff. The controller, pilot and ground lead then
+ratify the agreed plan. Plain code checks every plan, and a deterministic planner takes over when the agents don't
+converge or the stakeholders reject the plan twice.
+
+## From consensus to a committed plan
+1. **Debate:** up to 3 turns. No consensus means the deterministic planner decides.
+2. **Summary:** the Chief of Staff sends the stakeholders the plan, every specialist's reasoning and its own. Safety
+   figures come from code; Claude only writes the narrative, and the brief still goes out if that call fails.
+3. **Vote:** each stakeholder agrees or disagrees with a reason. All three agree: the plan is committed.
+4. **New round:** any disagreement rejects the plan. The Chief collates the objections, which go to every specialist,
+   and a new debate of up to 3 turns starts. The rejected plan can't be kept as the "best safe plan so far".
+5. **Second vote:** if that plan is rejected too, the deterministic planner decides. Its plan can match one the
+   stakeholders rejected, because it can't read their reasons; the fallback reason says so when that happens.
+
+People vote in SUPERVISED and STEP_BY_STEP. In AUTONOMOUS, and for anyone left out of a vote, the AI agent answers, and
+one that can't answer counts as disagreeing. The log and the outcome record who gave each vote. The vote card is one
+shared screen with no sign-in, so the log can't tell which person pressed which button.
 
 | Agent | Role (A-CDM) | Private instruments |
 |---|---|---|
-| `agents/atc_agent.py` | Arrival Manager + ground movement | METAR, runway wind components, closures, wake minima, real + simulated traffic, AMAN free slots |
-| `agents/pilot_agent.py` | Captain / FMS | FOB, FRF + ALTN, latest safe TLDT, PIREPs (turbulence/icing), crosswinds, real onward connections |
-| `agents/ground_agent.py` | AOCC turnaround coordinator | stands, EIBT, next-leg TOBT (real DOT schedule), crew duty, ramp lightning closure, de-icing |
+| `agents/atc_agent.py` | Arrival Manager + ground movement | METAR, runway wind components, closures, wake minima, runway capacity, real + simulated traffic, AMAN free slots |
+| `agents/pilot_agent.py` | Captain / FMS | FOB, FRF + ALTN + contingency, latest safe TLDT, flight crew duty, PIREPs (turbulence/icing), crosswinds, real onward connections |
+| `agents/ground_agent.py` | AOCC turnaround coordinator | stands, spare stands, gate-change notice, EIBT, next-leg TOBT (real DOT schedule), crew shifts and overtime, ramp lightning closure, de-icing |
 | `agents/moderator.py` | Chief of Staff (Duty Ops Manager) | public facts only; no vote |
 
 ## Talking to the team (Ops chat page, the default)
@@ -38,7 +52,7 @@ points.
 
 ## Real-world stress tests (`stress.py`, Control room → 🔥 Stress tests)
 Each case replays a documented failure mode against the live engine and checks: no crash · never an unsafe agreed
-plan · ≤ 3 turns · inside the time budget · log intact.
+plan · ≤ 3 turns per round · inside the time budget · log intact.
 | Case | Real-world basis | What must happen |
 |---|---|---|
 | NATS_RECORD | UK NATS Aug 2023: two beacons with one name crashed primary and identical backup | bad/ambiguous records quarantined, rest of batch continues; fallback is independent code |
@@ -71,6 +85,38 @@ summarised reasoning, `thinking.display: "summarized"`), pending decisions, alar
 against this exact contract.
 
 ## Data
+- `data/flights.csv` is the US DOT 2015 extract. Each scenario starts from one of its rows.
+- `data/challenge2_operational_constraints.xlsx` is the organisers' limits workbook, loaded by `limits.py`. Its airport
+  figures are synthetic, as the workbook says. The consensus log records its SHA-256 and the airport's limits.
+
+| Workbook rule | Where it applies |
+|---|---|
+| `active_runways`, `max_runway_ops_per_hour` | Runways in the scenario; background traffic; hard check `runway_capacity` |
+| `gates`, `spare_gates_at_any_time` | Contact stands; how many are free when the aircraft is due |
+| `min_turnaround_min` | Floor on the turnaround time |
+| Wake table (Super, Heavy, Large, Small) | Hard check `wake_separation` |
+| Final reserve, contingency, holding burn, spare fuel | Fuel on board, minimum landing fuel, hard check `fuel_reserve` |
+| Flight crew max duty | Hard check `flight_crew_duty` |
+| Ground crew shift, overtime multiplier | Shift changes; overtime is a soft check and a cost, not a hard limit |
+| Gate change notice | Hard check `gate_change_notice` |
+| One turn = each agent sends one message; 3 turns, then the fallback | `negotiation.py`, per round of debate |
+
+**What this team added or assumed.** The workbook asks teams to state these in the demo:
+- **Turn limit (changed):** the first consensus must come within the workbook's 3 turns. If the stakeholders then reject
+  it, a second round gets up to 3 more, so a flight can take up to 6 turns. Ratification itself is not a turn.
+- **Stricter than the workbook:** the alternate's fuel (ALTN) is protected as well as the final reserve; the 5%
+  contingency is protected rather than available for holding; IMC adds 1 min of spacing and lowers the background
+  arrival rate; holding in severe PIREPs is capped at 10 min; crosswind and tailwind limits.
+- **Wake table:** the workbook's `min_separation_nm` is converted to whole minutes at a 140 kt final approach, rounded
+  up. Its `min_time_s` column is for departures, which are not planned here.
+- **Capacity:** half of `max_runway_ops_per_hour` is left for departures when generating background arrivals. The hard
+  check counts arrivals only, because departures are not modelled.
+- **Stands:** at most 10 contact stands are modelled, plus a remote bay `R1`. Which stands are busy is simulated.
+- **Crew:** flight crew report 60 min before departure, and duty is estimated from the tail's legs because DOT has no
+  crew data. Ground shifts change at 06:00, 14:00 and 22:00 local.
+- **Gate-change notice:** counted from when the negotiation opens (simulated, 10-40 min before ELDT) to the landing time.
+- **Aircraft:** DOT has no aircraft type, so distance >= 2000 mi means Heavy and anything shorter means Large. Super and
+  Small only appear in simulated background traffic. Cruise burn and speed, used for trip and alternate fuel, are ours.
 - `eda.py` produces `eda/EDA_REPORT.md` and `eda/calibration.json` (taxi-in, arrival rates, turnaround). Key findings: the file
   is pre-filtered, all rows already meet the rule, October is missing, 88% of rows are late-aircraft only, and inbound delay
   propagates to the next leg with correlation 0.76.
@@ -80,11 +126,12 @@ against this exact contract.
 - `weather_poller.py` refreshes the live cache on an interval.
 
 ## Safety and control
-- Hard checks (`constraints.py`): wake separation (+1 min IMC), runway closure, crosswind ≤ 33 kt / tailwind ≤ 10 kt,
-  FRF + ALTN, max 10 min holding in SEV PIREPs, stand size and availability, crew duty cap.
+- Hard checks (`constraints.py`): wake separation (+1 min IMC), runway capacity, runway closure, crosswind ≤ 33 kt /
+  tailwind ≤ 10 kt, FRF + ALTN + contingency, flight crew duty, max 10 min holding in SEV PIREPs, stand size and
+  availability, gate-change notice.
 - Real-ID enums: agents can only name runways and stands that exist in the scenario. Plan numbers make stale replies
   get discarded.
-- Autonomy tiers: AUTONOMOUS, SUPERVISED and STEP_BY_STEP. Decision points cover consensus review, turn review,
+- Autonomy tiers: AUTONOMOUS, SUPERVISED and STEP_BY_STEP. Decision points cover stakeholder votes, turn review,
   deadlock, agent timeout or failure (wait and retry, keep the best safe plan, or fallback) and fallback review. Humans
   are only offered plans that pass every hard check.
 - Alarms (`escalation.py`): on-screen banner, toast and sound, a webhook, a macOS notification and a tap-to-call duty
@@ -103,5 +150,5 @@ python run_negotiation.py --row 40 --agents rules   # offline, free
 python weather_poller.py --airports ORD ATL --interval 300
 python batch_eval.py --agents rules --n 5           # free baseline
 python batch_eval.py --split test --n 4             # Claude agents on held-out flights (~$0.2-0.5 per flight)
-python -m unittest discover tests         # 22 offline tests
+python -m unittest discover tests         # 53 offline tests
 ```

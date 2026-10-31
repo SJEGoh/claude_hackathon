@@ -7,8 +7,8 @@ import watch
 from escalation import push
 from ui_common import fire_test_alert, hero
 
-hero("Ops settings · runway condition, approach mode, operating limits, ground resources, weather watch and "
-     "notifications. Every value is read live by the safety checks and the agents.", compact=True)
+hero("Ops settings · runway condition, approach mode, ramp staffing, weather watch and notifications. A layer on "
+     "top of the organisers' workbook limits: it can only make operations stricter.", compact=True)
 
 cfg = O.get()
 tab_cfg, tab_watch = st.tabs(["⚙️ Settings", "📡 Weather watch board"])
@@ -23,24 +23,17 @@ with tab_cfg:
                                       "Illustrative table: replace with your operator's figures in ops_settings.py.")
         approach = c2.selectbox("Approach mode", ["AUTO", "VISUAL", "ILS_CAT_I", "ILS_CAT_II_III"],
                                 index=["AUTO", "VISUAL", "ILS_CAT_I", "ILS_CAT_II_III"].index(cfg.approach),
-                                help="AUTO follows the METAR (IFR/LIFR adds spacing). CAT II/III = low-visibility "
-                                     "procedures: +2 min on every arrival pair.")
+                                help="The workbook rules already add 1 min in IMC. CAT II/III (low-visibility procedures) "
+                                     "adds 1 more on every arrival pair.")
         c1, c2 = st.columns(2)
         xw = c1.number_input("Max crosswind incl. gust (kt)", 5.0, 45.0, float(cfg.max_crosswind_kt))
         tw = c2.number_input("Max tailwind (kt)", 0.0, 15.0, float(cfg.max_tailwind_kt))
 
-        st.subheader("🧑‍✈️ Flight crew limits")
-        c1, c2, c3 = st.columns(3)
-        adv = c1.number_input("MINIMUM FUEL advisory margin (min)", 0, 30, cfg.min_fuel_advisory_margin_min)
-        sev = c2.number_input("Max holding in SEV turbulence/icing (min)", 0, 30, cfg.severe_hold_limit_min)
-        mct = c3.number_input("Minimum connection time (min)", 20, 120, cfg.min_connect_time_min)
-
         st.subheader("🧳 Ground resources")
-        c1, c2, c3 = st.columns(3)
-        staff = c1.slider("Ramp staffing (%)", 25, 100, cfg.ramp_staffing_pct,
+        staff = st.slider("Ramp staffing (%)", 25, 100, cfg.ramp_staffing_pct,
                           help="Below 100% stretches every turnaround proportionally.")
-        ot = c2.number_input("Crew overtime legal cap (min)", 0, 120, cfg.max_crew_overtime_min)
-        remote = c3.toggle("Allow remote stands", cfg.allow_remote_stands)
+        st.caption("Fuel reserves, crew duty, gate-change notice, overtime and wake separation come from the "
+                   "organisers' workbook (data/challenge2_operational_constraints.xlsx) and are not overridden here.")
 
         st.subheader("🤝 Negotiation")
         c1, c2 = st.columns(2)
@@ -67,8 +60,7 @@ with tab_cfg:
         if st.form_submit_button("💾 Save settings", type="primary"):
             O.save(O.OpsSettings(
                 rwycc=rwycc, approach=approach, max_crosswind_kt=xw, max_tailwind_kt=tw,
-                min_fuel_advisory_margin_min=adv, severe_hold_limit_min=sev, min_connect_time_min=mct,
-                ramp_staffing_pct=staff, allow_remote_stands=remote, max_crew_overtime_min=ot, time_budget_s=budget,
+                ramp_staffing_pct=staff, time_budget_s=budget,
                 default_autonomy=autonomy, watch_airports=[a.strip().upper() for a in airports.split(",") if a.strip()],
                 watch_interval_s=interval, checks=checks, gust_alert_kt=gust, heavy_rain_mm_h=rain,
                 push_min_severity=push_sev, notify_sound=sound, notify_desktop=desktop, ntfy_topic=ntfy.strip()))
@@ -76,7 +68,7 @@ with tab_cfg:
 
     cur = O.get()
     st.info(f"**Effective now:** crosswind limit {cur.crosswind_limit():.0f} kt at RWYCC {cur.rwycc} · "
-            f"+{cur.extra_spacing(False)} min spacing in VMC / +{cur.extra_spacing(True)} in IMC · turnaround ×"
+            f"+{cur.extra_spacing_beyond_workbook()} min spacing on top of the workbook rules · turnaround ×"
             f"{100 / cur.ramp_staffing_pct:.2f}" + (" · **RUNWAYS CLOSED (RWYCC 0)**" if cur.runway_closed_by_condition() else ""))
     c1, c2 = st.columns(2)
     if c1.button("🧪 Fire a test ALARM (sound + every channel)"):

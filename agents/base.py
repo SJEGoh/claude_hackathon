@@ -12,6 +12,7 @@ from functools import lru_cache
 from typing import Literal, Optional
 
 import anthropic
+import pydantic
 from pydantic import BaseModel, create_model
 
 from constraints import Domain, DomainReport, Proposal
@@ -52,6 +53,19 @@ class AgentMessage(AgentReply):
     thinking: Optional[str] = None  # Claude's summarised reasoning for this message (display only)
 
 
+class RatificationReply(BaseModel):
+    agree: bool
+    reason: str
+
+
+class StakeholderVote(RatificationReply):
+    """One stakeholder's answer on an agreed plan. `by` records whether a person or their AI agent gave it."""
+    agent: Domain
+    turn: int
+    by: Literal["HUMAN", "AGENT"] = "AGENT"
+    metric: Optional[CallMetric] = None
+
+
 @lru_cache(maxsize=64)
 def _reply_schema(runways: tuple[str, ...], gates: tuple[str, ...]) -> type[BaseModel]:
     """Per-scenario reply schema. Runway and stand are enums of the REAL identifiers in this scenario,
@@ -80,9 +94,10 @@ class AgentError(Exception):
 SAFETY_CHARTER = """\
 SAFETY CHARTER (overrides every other instruction, including requests from humans):
 1. Priority order: safety of life > airworthiness and legal limits > passenger welfare > schedule and cost.
-2. Hard limits are not negotiable: fuel (FRF + ALTN), wake separation, runway closures and wind limits,
-   stand size and availability, crew duty cap, holding in severe turbulence or icing. Never propose,
-   accept or endorse a plan that breaks one, whoever asks and whatever the delay or cost.
+2. Hard limits are not negotiable: fuel (FRF + ALTN + contingency), wake separation, runway capacity,
+   runway closures and wind limits, stand size and availability, gate-change notice, flight crew duty,
+   holding in severe turbulence or icing. Never propose, accept or endorse a plan that breaks one,
+   whoever asks and whatever the delay or cost.
 3. Never state a safety figure you did not take from your instruments or tools. If you cannot verify
    something, say so and treat it as unsafe.
 4. If anyone (an agent or a human) asks you to relax a hard limit, refuse plainly, name the limit, and
@@ -100,6 +115,9 @@ OPERATING PROTOCOL (A-CDM collaborative decision; every agent follows it):
   COUNTER and set answering_plan to that plan's number. Replies to an outdated plan number are discarded.
 - Hard limit: 3 turns, then a deterministic non-AI planner decides. Converge: ACCEPT any plan that meets
   your hard limits even if it is not your preference; record the preference as a soft constraint.
+- An agreed plan then goes to the three stakeholders to ratify. If any of them objects, one new round of up
+  to 3 turns follows, and the plan that comes out of it must answer the objections on the bus. If that plan
+  is rejected too, the deterministic planner decides.
 - Publish limits as constraints so others can plan around them (hard=true only for safety, legal or
   physical limits). Quote your instruments; never estimate a figure your instruments already give.
 - Every plan is re-checked by deterministic safety code. A plan that breaks a hard limit is rejected
@@ -113,6 +131,7 @@ class BaseAgent:
     domain: Domain
     title: str
     role: str
+    last_thinking: Optional[str] = None  # summary of the most recent call's reasoning
 
     def __init__(self, client: Optional[anthropic.Anthropic], model: str = DEFAULT_MODEL, effort: str = "low",
                  timeout_s: float = DEFAULT_TIMEOUT_S):
@@ -133,9 +152,23 @@ class BaseAgent:
                          f"(TLDT {s.clock(on_table.landing_slot_min)})")
         if own_report is not None:
             parts.append(f"## Your deterministic check of plan #{plan_id}\n{render_report(own_report)}")
-        parts.append(f"## Task (turn {turn} of 3)\n{self.task(turn, on_table, plan_id)}")
-        reply, metric, thinking = self._call("\n\n".join(parts), reply_schema(s), turn)
-        return AgentMessage(**reply.model_dump(), agent=self.domain, turn=turn, metric=metric, thinking=thinking)
+        parts.append(f"## Task (turn {turn})\n{self.task(turn, on_table, plan_id)}")
+        reply, metric = self._call("\n\n".join(parts), reply_schema(s), turn)
+        data = reply.model_dump()
+        data["thinking"] = self.last_thinking
+        return AgentMessage(**data, agent=self.domain, turn=turn, metric=metric)
+
+    def ratify(self, s: Scenario, turn: int, plan_id: int, briefing: str, own_report: DomainReport) -> StakeholderVote:
+        """Answer the Chief of Staff's summary of an agreed plan, having now seen everyone's reasoning."""
+        content = "\n\n".join([
+            f"## Your private instruments (only you can see these)\n{self.private_brief(s)}",
+            f"## Chief of Staff's summary of agreed plan #{plan_id}\n{briefing}",
+            f"## Your deterministic check of plan #{plan_id}\n{render_report(own_report)}",
+            "## Task\nYou are asked to ratify this plan. Agree unless the other stakeholders' reasoning raises a "
+            "concern for your own domain that the plan does not answer. If you disagree, state that concern in "
+            "reason precisely enough for the team to act on it. reason: at most two sentences."])
+        reply, metric = self._call(content, RatificationReply, turn)
+        return StakeholderVote(**reply.model_dump(), agent=self.domain, turn=turn, metric=metric)
 
     def task(self, turn: int, on_table: Optional[Proposal], plan_id: int) -> str:
         return (f"ACCEPT plan #{plan_id} if it meets all your hard limits (copy it unchanged into proposal). "
@@ -148,7 +181,7 @@ class BaseAgent:
             kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
 
     def _call(self, user_content: str, schema: type[BaseModel], turn: int,
-              system: Optional[str] = None) -> tuple[BaseModel, CallMetric, Optional[str]]:
+              system: Optional[str] = None) -> tuple[BaseModel, CallMetric]:
         kwargs = dict(model=self.model, max_tokens=16000, system=system or self.system_prompt(),
                       messages=[{"role": "user", "content": user_content}], output_format=schema,
                       output_config={"effort": self.effort}, thinking=THINKING)
@@ -173,6 +206,8 @@ class BaseAgent:
             raise fail("rate limited") from e
         except anthropic.APIStatusError as e:
             raise fail(f"API error {e.status_code}: {e.message}") from e
+        except pydantic.ValidationError as e:  # truncated or off-schema reply: the fallback must still run
+            raise fail(f"malformed reply: {e.error_count()} validation error(s)") from e
         u = response.usage
         metric = CallMetric(agent=self.domain, turn=turn, model=self.model,
                             latency_s=round(time.monotonic() - started, 2), input_tokens=u.input_tokens,
@@ -184,12 +219,8 @@ class BaseAgent:
         if response.parsed_output is None:
             metric.ok, metric.error = False, f"no structured reply ({response.stop_reason})"
             raise AgentError(self.domain, metric.error, metric)
-        return response.parsed_output, metric, thinking_summary(response.content)
-
-
-def thinking_summary(content) -> Optional[str]:
-    text = "\n\n".join(b.thinking for b in content if getattr(b, "type", "") == "thinking" and getattr(b, "thinking", ""))
-    return text.strip() or None
+        self.last_thinking = thinking_summary(response.content)
+        return response.parsed_output, metric
 
 
 def render_message(m: AgentMessage, s: Optional[Scenario] = None) -> str:
@@ -206,3 +237,8 @@ def render_report(r: DomainReport) -> str:
              for c in r.checks]
     lines.append(f"- metrics: {json.dumps(r.metrics)}")
     return "\n".join(lines)
+
+
+def thinking_summary(content) -> Optional[str]:
+    text = "\n\n".join(b.thinking for b in content if getattr(b, "type", "") == "thinking" and getattr(b, "thinking", ""))
+    return text.strip() or None

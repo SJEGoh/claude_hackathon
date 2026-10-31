@@ -9,16 +9,16 @@ import anthropic
 import config  # noqa: F401  (loads .env)
 from agents.atc_agent import ATCAgent
 from agents.base import (
-    DEFAULT_MODEL, DEFAULT_TIMEOUT_S, AgentError, AgentMessage, AgentReply, BaseAgent, ConstraintClaim, render_message,
-    render_report, reply_schema,
+    DEFAULT_MODEL, DEFAULT_TIMEOUT_S, AgentError, AgentMessage, AgentReply, BaseAgent, ConstraintClaim, StakeholderVote,
+    render_message, render_report, reply_schema,
 )
 from agents.ground_agent import GroundAgent
 from agents.moderator import ModeratorAgent, ModeratorMessage, render_brief
 from agents.pilot_agent import PilotAgent
 
 __all__ = ["ATCAgent", "PilotAgent", "GroundAgent", "ModeratorAgent", "BaseAgent", "AgentError", "AgentMessage",
-           "AgentReply", "ConstraintClaim", "ModeratorMessage", "DEFAULT_MODEL", "DEFAULT_TIMEOUT_S", "make_agents",
-           "render_message", "render_brief", "render_report", "reply_schema"]
+           "AgentReply", "ConstraintClaim", "ModeratorMessage", "StakeholderVote", "DEFAULT_MODEL", "DEFAULT_TIMEOUT_S",
+           "make_agents", "render_message", "render_brief", "render_report", "reply_schema"]
 
 ROLES = {"ATC": ATCAgent, "PILOT": PilotAgent, "GROUND": GroundAgent, "MODERATOR": ModeratorAgent}
 

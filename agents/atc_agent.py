@@ -3,10 +3,11 @@ from __future__ import annotations
 
 from typing import Optional
 
+import ops_settings
 from agents.base import BaseAgent
 from constraints import Domain, Proposal, check_atc
-import ops_settings
-from scenario import WAKE_SEPARATION_MIN, Scenario
+from scenario import IMC_EXTRA_SPACING_MIN, LIMITS, WAKE_ABBR, WAKE_SEPARATION_MIN, Scenario
+from weather import MAX_CROSSWIND_KT, MAX_TAILWIND_KT
 
 
 class ATCAgent(BaseAgent):
@@ -19,17 +20,20 @@ class ATCAgent(BaseAgent):
             "published constraints into it.")
 
     def private_brief(self, s: Scenario) -> str:
-        cfg = ops_settings.get()
-        seps = ", ".join(f"{a[0]}->{b[0]} {v}" for (a, b), v in WAKE_SEPARATION_MIN.items())
+        seps = ", ".join(f"{WAKE_ABBR[a]}->{WAKE_ABBR[b]} {LIMITS.wake_nm[(a, b)]} NM = {v} min"
+                         for (a, b), v in WAKE_SEPARATION_MIN.items() if s.wake in (a, b))
         wx = s.weather
+        cap = s.airport_limits
         lines = [
             f"Inbound {s.flight} ({s.aircraft_type}, wake {s.wake}) {s.origin}-{s.destination}. "
             f"ELDT {s.clock(s.eta_min)} (slot {s.eta_min}). SIBT {s.clock(0)}.",
             f"METAR: {wx.metar if wx and wx.metar else 'not available'}",
-            f"Conditions: {'IMC' if s.imc else 'VMC'}; approach mode {cfg.approach}; runway condition RWYCC {cfg.rwycc}"
-            f" (+{cfg.extra_spacing(s.imc)} min spacing on every pair). Wake minima min (leader->follower): {seps}. "
-            f"Limits: crosswind {cfg.crosswind_limit():.0f} kt, tailwind {cfg.max_tailwind_kt:.0f} kt"
-            + (". RWYCC 0: ALL RUNWAYS CLOSED (nil braking)." if cfg.runway_closed_by_condition() else "."),
+            f"Conditions: {'IMC' if s.imc else 'VMC'}{f' (+{IMC_EXTRA_SPACING_MIN} min spacing)' if s.imc else ''}. "
+            f"Wake minima for this flight (leader->follower; J Super, H Heavy, L Large, S Small): {seps}. Limits: "
+            f"crosswind {MAX_CROSSWIND_KT} kt, tailwind {MAX_TAILWIND_KT} kt.",
+            f"{s.destination} is a {cap.size_class}: {cap.active_runways} active runway(s), max "
+            f"{cap.max_runway_ops_per_hour} runway ops/h.",
+            ops_settings.atc_note(s.imc),
             s.taxiway_note,
             f"Scheduled stand on the flight plan: {s.scheduled_gate} (AOCC owns stand allocation).",
         ]
@@ -40,7 +44,7 @@ class ATCAgent(BaseAgent):
                 + (f" until {s.clock(r.closed_until)} (slot {r.closed_until})" if r.closed_until > -999 else "")
                 + f"; wind head {r.headwind_kt} / cross {r.crosswind_kt} / tail {r.tailwind_kt} kt"
                 + f"; taxi-in to terminal A {r.taxi_min['A']}, B {r.taxi_min['B']}, remote {r.taxi_min['R']} min"
-                + "; arrivals: " + ", ".join(f"{t.t}({t.wake[0]})" for t in window))
+                + "; arrivals: " + ", ".join(f"{t.t}({WAKE_ABBR[t.wake]})" for t in window))
         lines.append("AMAN conflict-free slots (ATC checks only; fuel, stands and crew NOT considered): "
                      + "; ".join(f"{rid}: {v}" for rid, v in self.free_slots(s).items()))
         return "\n".join(lines)
