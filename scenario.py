@@ -7,10 +7,12 @@ What is REAL (traceable to a source) and what is SIMULATED (seeded, deterministi
   real       flight, route, date, delays (DOT); arrivals of other DOT flights at that airport (WHEELS_ON);
              real onward connections and the aircraft's next leg (DOT); taxi-in times and turnaround norms
              (EDA calibration); runway identifiers and headings (OurAirports); METAR, PIREPs, ERA5 weather
-             (IEM, Open-Meteo, or live aviationweather.gov); nearest plausible alternate (airports.csv)
-  simulated  extra background traffic to match the EDA arrival-rate estimate (the extract is ~1/15 of all
-             flights), gate layout and occupancy, fuel on board, crew shift end, passenger counts, and the
-             injected taxiway blockage
+             (IEM, Open-Meteo, or live aviationweather.gov); nearest plausible alternate (OurAirports)
+  workbook   runways, runway capacity, stands, spare stands, minimum turnaround, wake minima, fuel rules and crew
+             rules (limits.py; the organisers' planning limits, synthetic by their own description)
+  simulated  extra background traffic up to the workbook's capacity (the extract is ~1/15 of all flights), which
+             stands are occupied and when, passenger counts, when the negotiation opens, and the injected
+             taxiway blockage
 """
 from __future__ import annotations
 
@@ -27,32 +29,37 @@ import pandas as pd
 from pydantic import BaseModel
 
 import weather as W
+from limits import WAKE_CATEGORIES, AirportLimits, load_limits
 
 ROOT = Path(__file__).parent
-FLIGHTS_CSV = ROOT / "flights.csv"
-AIRPORTS_CSV = ROOT / "airports.csv"
+FLIGHTS_CSV = ROOT / "data" / "flights.csv"
 CALIBRATION = ROOT / "eda" / "calibration.json"
 
-Wake = Literal["HEAVY", "MEDIUM"]
+Wake = Literal["SUPER", "HEAVY", "LARGE", "SMALL"]
 WeatherMode = Literal["HISTORICAL", "LIVE", "OFF"]
 
-# Minimum time (min) between a LEADER and the FOLLOWER landing behind it on the same runway (simplified
-# time-based ICAO wake categories). IMC adds IMC_EXTRA_SPACING_MIN to every pair.
-WAKE_SEPARATION_MIN = {("HEAVY", "HEAVY"): 2, ("HEAVY", "MEDIUM"): 3, ("MEDIUM", "HEAVY"): 2,
-                       ("MEDIUM", "MEDIUM"): 2}
+LIMITS = load_limits()
+# Minimum time (min) between a LEADER and the FOLLOWER landing behind it on the same runway, from the workbook's
+# wake table. IMC adds IMC_EXTRA_SPACING_MIN to every pair.
+WAKE_SEPARATION_MIN = {(a, b): LIMITS.wake_min(a, b) for a in WAKE_CATEGORIES for b in WAKE_CATEGORIES}
+WAKE_ABBR = {"SUPER": "J", "HEAVY": "H", "LARGE": "L", "SMALL": "S"}  # ICAO letters: Super and Small both start with S
 IMC_EXTRA_SPACING_MIN = 1
 MIN_CONNECT_TIME_MIN = 40
-MAX_CREW_OVERTIME_MIN = 30
-FINAL_RESERVE_MIN = 30          # ICAO final reserve fuel, at holding burn
-MIN_FUEL_ADVISORY_MARGIN_MIN = 10  # ICAO "MINIMUM FUEL" is declared inside this margin above FRF + ALTN
+MIN_FUEL_ADVISORY_MARGIN_MIN = 10  # ICAO "MINIMUM FUEL" is declared inside this margin above the protected reserves
 SEVERE_HOLD_LIMIT_MIN = 10      # max holding inside reported SEV turbulence / icing
 DEICE_EXTRA_MIN = 15
-MAX_RUNWAY_RATE_PER_H = {"VMC": 28, "IMC": 22}
 WIDEBODY_DISTANCE_MI = 2000
+# The workbook leaves these open; they are stated in the README as this team's assumptions.
+ARRIVAL_SHARE = 0.5             # share of max_runway_ops_per_hour left for arrivals (departures are not modelled)
+IMC_CAPACITY_FACTOR = 22 / 28   # background arrival rate in IMC relative to VMC
+MODELLED_STANDS = 10            # contact stands the planner and Ground agent see (a subset at bigger airports)
+FLIGHT_CREW_REPORT_LEAD_MIN = 60  # report time before the first departure of the duty
+SHIFT_CHANGE_HOUR = 6           # ground shifts follow the workbook's length, starting from this local hour
 AIRCRAFT = {  # Airbus-family stand-ins chosen by wake category (DOT has no aircraft type)
-    "MEDIUM": {"type": "A320neo-class", "hold_kg_min": 38, "cruise_kg_min": 42, "cruise_nm_min": 7.3},
-    "HEAVY": {"type": "A330neo-class", "hold_kg_min": 95, "cruise_kg_min": 100, "cruise_nm_min": 7.8},
+    "LARGE": {"type": "A320neo-class", "body": "narrowbody", "cruise_kg_min": 42, "cruise_nm_min": 7.3},
+    "HEAVY": {"type": "A330neo-class", "body": "widebody", "cruise_kg_min": 100, "cruise_nm_min": 7.8},
 }
+CALIBRATION_WAKE = {"LARGE": "MEDIUM", "HEAVY": "HEAVY"}  # eda/calibration.json keys
 
 
 class TrafficSlot(BaseModel):
@@ -122,16 +129,19 @@ class Scenario(BaseModel):
     weather_attribution: str
     imc: bool
     airport_icao: str
+    airport_limits: AirportLimits
 
     # --- PILOT domain ---
     wake: Wake
     aircraft_type: str
     eta_min: int  # earliest landing (ELDT) given the inbound delay
     fob_at_eta_kg: int
-    hold_burn_kg_per_min: int
+    hold_burn_kg_per_min: float
     final_reserve_kg: int
     alternate: str
     alternate_fuel_kg: int
+    contingency_fuel_kg: int
+    flight_duty_end_min: int  # latest in-block inside the flight crew's duty limit
     connections: list[Connection]
 
     # --- ATC domain ---
@@ -144,19 +154,25 @@ class Scenario(BaseModel):
     turnaround_min: int
     deice_required: bool
     ramp_closed_until: int  # lightning: ground handling suspended
-    crew_shift_end_min: int
+    crew_shift_end_min: int  # end of the ground shift on duty when the aircraft is due
+    decision_time_min: int  # when the negotiation opens; gate-change notice counts from here
     next_leg: Optional[NextLeg]
 
     @property
     def min_landing_fuel_kg(self) -> int:
-        return self.final_reserve_kg + self.alternate_fuel_kg
+        return self.final_reserve_kg + self.alternate_fuel_kg + self.contingency_fuel_kg
 
     @property
     def latest_safe_landing(self) -> int:
-        return self.eta_min + (self.fob_at_eta_kg - self.min_landing_fuel_kg) // self.hold_burn_kg_per_min
+        return self.eta_min + int((self.fob_at_eta_kg - self.min_landing_fuel_kg) // self.hold_burn_kg_per_min)
 
     def fuel_at(self, slot: int) -> int:
-        return self.fob_at_eta_kg - max(0, slot - self.eta_min) * self.hold_burn_kg_per_min
+        return round(self.fob_at_eta_kg - max(0, slot - self.eta_min) * self.hold_burn_kg_per_min)
+
+    def shift_end_at(self, start: int) -> int:
+        """End of the ground shift on duty at `start`: the first shift change after it."""
+        shift = LIMITS.ground_shift_h * 60
+        return self.crew_shift_end_min + ((start - self.crew_shift_end_min) // shift + 1) * shift
 
     def clock(self, offset_min: int) -> str:
         hh, mm = int(self.scheduled_arrival_hhmm[:2]) % 24, int(self.scheduled_arrival_hhmm[2:])
@@ -210,8 +226,12 @@ def calibration() -> dict:
 
 
 @lru_cache(maxsize=1)
-def _airports() -> pd.DataFrame:
-    return pd.read_csv(AIRPORTS_CSV)
+def _airport_coords() -> dict[str, tuple[float, float]]:
+    """Coordinates of the workbook's airports, from OurAirports. A few US airports have no IATA code there."""
+    by_ident = {a["ident"]: a for a in W._ourairports("airports")}
+    by_iata = {a["iata_code"]: a for a in by_ident.values() if a["iata_code"]}
+    found = {code: by_iata.get(code) or by_ident.get(f"K{code}") for code in LIMITS.airports}
+    return {code: (float(a["latitude_deg"]), float(a["longitude_deg"])) for code, a in found.items() if a}
 
 
 @lru_cache(maxsize=1)
@@ -221,16 +241,15 @@ def _busy_airports() -> set[str]:
 
 
 def _nearest_alternate(dest: str) -> tuple[str, float]:
-    a = _airports().dropna(subset=["LATITUDE"])
-    row = a[a.IATA_CODE == dest]
-    if row.empty:
+    coords = _airport_coords()
+    if dest not in coords:
         return "n/a", 150.0
-    lat, lon = float(row.LATITUDE.iloc[0]), float(row.LONGITUDE.iloc[0])
+    lat, lon = coords[dest]
     best = None
-    for r in a[a.IATA_CODE.isin(_busy_airports()) & (a.IATA_CODE != dest)].itertuples():
-        d = W._distance_nm(lat, lon, r.LATITUDE, r.LONGITUDE)
+    for code in sorted(_busy_airports() & coords.keys() - {dest}):
+        d = W._distance_nm(lat, lon, *coords[code])
         if d >= 60 and (best is None or d < best[1]):
-            best = (r.IATA_CODE, d)
+            best = (code, d)
     return best or ("n/a", 150.0)
 
 
@@ -247,11 +266,33 @@ def _wrap(offset: int) -> int:
     return (offset + 720) % 1440 - 720
 
 
-def _pick_runways(ref: Optional[W.AirportRef], brief: Optional[W.WeatherBrief]) -> list[tuple[W.RunwayEnd, W.RunwayWind]]:
+def _sim_wake(rng: random.Random, size_class: str) -> Wake:
+    """Background traffic mix: DOT has no aircraft types. A380s only appear at the workbook's large hubs."""
+    r = rng.random()
+    if r < 0.02 and size_class == "Large hub":
+        return "SUPER"
+    return "HEAVY" if r < 0.15 else "SMALL" if r < 0.20 else "LARGE"
+
+
+def _flight_duty_end(row: pd.Series, flights: pd.DataFrame) -> int:
+    """Latest in-block (minutes from SIBT) inside the flight crew's duty limit. DOT has no crew data, so the duty
+    is estimated from the tail's earlier legs that day that one crew could have flown within the limit."""
+    duty = LIMITS.flight_crew_max_duty_h * 60
+    sched = int(row.SCHEDULED_TIME)
+    sd = int(row.SCHEDULED_DEPARTURE) // 100 % 24 * 60 + int(row.SCHEDULED_DEPARTURE) % 100
+    earliest = sd - (duty - FLIGHT_CREW_REPORT_LEAD_MIN - sched)
+    legs = flights[(flights.TAIL_NUMBER == row.TAIL_NUMBER) & (flights.MONTH == row.MONTH) & (flights.DAY == row.DAY)
+                   & flights.SD_MIN.between(earliest, sd)]
+    first = int(legs.SD_MIN.min()) if len(legs) else sd
+    return duty - FLIGHT_CREW_REPORT_LEAD_MIN - (sd - first) - sched
+
+
+def _pick_runways(ref: Optional[W.AirportRef], brief: Optional[W.WeatherBrief], count: int
+                  ) -> list[tuple[W.RunwayEnd, W.RunwayWind]]:
     if ref is None or not ref.runway_ends:
         fake = [W.RunwayEnd(ident=i, heading_true=h, length_ft=10000, physical="A/B") for i, h in (("RWY1", 0), ("RWY2", 90))]
         return [(e, W.RunwayWind(runway=e.ident, headwind_kt=0, crosswind_kt=0, tailwind_kt=0, within_limits=True))
-                for e in fake]
+                for e in fake[:count]]
     winds = {w.runway: w for w in (brief.runway_winds if brief else W.runway_winds(ref.runway_ends, None, None, None))}
     ranked = sorted(ref.runway_ends, key=lambda e: (not winds[e.ident].within_limits, -winds[e.ident].headwind_kt,
                                                      -e.length_ft, e.ident))
@@ -261,7 +302,7 @@ def _pick_runways(ref: Optional[W.AirportRef], brief: Optional[W.WeatherBrief]) 
             continue
         chosen.append((e, winds[e.ident]))
         physicals.add(e.physical)
-        if len(chosen) == 2:
+        if len(chosen) == count:
             break
     return chosen
 
@@ -272,9 +313,11 @@ def build_scenario(row: pd.Series, weather_mode: WeatherMode = "HISTORICAL") -> 
     dest = str(row.DESTINATION_AIRPORT)
     cal = calibration()
     cal_ap = cal.get("airports", {}).get(dest, {})
+    limits = LIMITS.airport(dest)
     weather_delay, late = int(row.WEATHER_DELAY), int(row.LATE_AIRCRAFT_DELAY)
-    wake: Wake = "HEAVY" if row.DISTANCE >= WIDEBODY_DISTANCE_MI else "MEDIUM"
+    wake: Wake = "HEAVY" if row.DISTANCE >= WIDEBODY_DISTANCE_MI else "LARGE"
     ac = AIRCRAFT[wake]
+    hold_kg_min = round(LIMITS.hold_kg_per_hour[ac["body"]] / 60, 2)
     sibt_min = int(row.SCHEDULED_ARRIVAL) // 100 % 24 * 60 + int(row.SCHEDULED_ARRIVAL) % 100
     sibt_local = datetime(int(row.YEAR), int(row.MONTH), int(row.DAY)) + timedelta(minutes=sibt_min)
 
@@ -285,8 +328,8 @@ def build_scenario(row: pd.Series, weather_mode: WeatherMode = "HISTORICAL") -> 
         brief = W.historical_brief(ref, sibt_local + timedelta(minutes=late))
     elif ref and weather_mode == "LIVE":
         brief = W.live_brief(ref)
-    picked = _pick_runways(ref, brief)
-    imc = bool(brief and brief.flight_category in ("IFR", "LIFR"))
+    picked = _pick_runways(ref, brief, limits.active_runways)
+    imc =bool(brief and brief.flight_category in ("IFR", "LIFR"))
     dest_wx = bool(brief and (brief.thunderstorm or brief.convective_nearby or imc or brief.freezing_precip_or_snow
                               or not any(w.within_limits for _, w in picked)))
     if brief is None:
@@ -315,18 +358,18 @@ def build_scenario(row: pd.Series, weather_mode: WeatherMode = "HISTORICAL") -> 
     flights = all_flights()
     same_day = flights[(flights.DESTINATION_AIRPORT == dest) & (flights.MONTH == row.MONTH) & (flights.DAY == row.DAY)
                        & (flights.index != row.get("index", -1))]
-    real = [(_wrap(int(wo) - sibt_min), f"{_PREFIX.get(a, a)}{int(n)}", "HEAVY" if d >= WIDEBODY_DISTANCE_MI else "MEDIUM")
+    real = [(_wrap(int(wo) - sibt_min), f"{_PREFIX.get(a, a)}{int(n)}", "HEAVY" if d >= WIDEBODY_DISTANCE_MI else "LARGE")
             for wo, a, n, d in zip(same_day.WO_MIN, same_day.AIRLINE, same_day.FLIGHT_NUMBER, same_day.DISTANCE)]
     window = (eta - 20, eta + 160)
     real = sorted(r for r in real if window[0] <= r[0] <= window[1])
     hour = (sibt_min + max(eta, 0)) // 60 % 24
     est_rate = cal_ap.get("arrivals_per_hour", {}).get(str(hour), 20.0)
-    cap = MAX_RUNWAY_RATE_PER_H["IMC" if imc else "VMC"]
-    per_runway_rate = min(cap, max(8.0, est_rate / max(1, len(picked))))
+    arrival_capacity = limits.max_runway_ops_per_hour * ARRIVAL_SHARE * (IMC_CAPACITY_FACTOR if imc else 1.0)
+    per_runway_rate = min(arrival_capacity, max(8.0, est_rate)) / max(1, len(picked))
 
     runways: list[Runway] = []
     for i, (end, wind) in enumerate(picked):
-        closed = weather_close - (rng.randint(4, 9) if i == 1 else 0) if weather_close > -999 else -999
+        closed = weather_close - (rng.randint(4, 9) if i >= 1 else 0) if weather_close > -999 else -999
         if not wind.within_limits:
             closure = f"wind out of limits (crosswind {wind.crosswind_kt} kt, tailwind {wind.tailwind_kt} kt)"
         else:
@@ -341,9 +384,11 @@ def build_scenario(row: pd.Series, weather_mode: WeatherMode = "HISTORICAL") -> 
             t = int(round(sim_t))
             if all(abs(t - s.t) >= 2 for s in mine + slots):
                 slots.append(TrafficSlot(t=t, callsign=f"{rng.choice(list(_PREFIX.values()))}{rng.randint(100, 3999)}",
-                                         wake="HEAVY" if rng.random() < 0.15 else "MEDIUM", source="SIM"))
+                                         wake=_sim_wake(rng, limits.size_class), source="SIM"))
             sim_t += step
-        taxi = {"A": taxi_p50 if i == 0 else taxi_p75 + 12, "B": taxi_p50 + 3 if i == 0 else taxi_p75, "R": taxi_p50 + 4}
+        blocked = i > 0 and i == len(picked) - 1  # the taxiway K closure below only affects the last runway
+        taxi = {"A": taxi_p50 if i == 0 else taxi_p75 + (12 if blocked else 0),
+                "B": taxi_p50 + 3 if i == 0 else taxi_p75, "R": taxi_p50 + 4}
         runways.append(Runway(id=end.ident, heading_true=end.heading_true, length_ft=end.length_ft,
                               closed_until=closed if closed > -999 else -999, closure_reason=closure,
                               headwind_kt=wind.headwind_kt, crosswind_kt=wind.crosswind_kt,
@@ -355,14 +400,21 @@ def build_scenario(row: pd.Series, weather_mode: WeatherMode = "HISTORICAL") -> 
     # --- ground ----------------------------------------------------------------
     cal_turn = cal.get("turnaround_min", {"MEDIUM": 40, "HEAVY": 56})
     deice = bool(brief and brief.freezing_precip_or_snow)
-    turnaround = int(cal_turn[wake]) + (DEICE_EXTRA_MIN if deice else 0)
+    base_turnaround = max(int(cal_turn[CALIBRATION_WAKE[wake]]), limits.min_turnaround_min)
+    turnaround = base_turnaround + (DEICE_EXTRA_MIN if deice else 0)
+    per_terminal = min(limits.gates, MODELLED_STANDS) // 2
+    stands = [(terminal, n) for terminal in ("A", "B") for n in range(1, per_terminal + 1)]
+    scheduled = 2  # the scheduled gate is still blocked by a late departure
+    spare = set(rng.sample([i for i in range(len(stands)) if i != scheduled], limits.spare_gates))
     gates: list[Gate] = []
-    for terminal in ("A", "B"):
-        for n in range(1, 6):
-            free_from = rng.choice([-60, -60, eta - 5, eta + 15, eta + 35, eta + 60])
-            gates.append(Gate(id=f"{terminal}{n}", terminal=terminal, widebody=n <= 2, free_from=free_from,
-                              free_until=free_from + rng.choice([70, 100, 140, 200, 600])))
-    gates[2].free_from = eta + 50  # the scheduled gate is still blocked by a late departure
+    for i, (terminal, n) in enumerate(stands):
+        if i in spare:  # free now and for long enough: the workbook's spare stands
+            free_from, free_until = -60, eta + rng.choice([100, 140, 200, 600])
+        else:
+            free_from = eta + 50 if i == scheduled else eta + rng.choice([15, 35, 60])
+            free_until = free_from + rng.choice([70, 100, 140, 200, 600])
+        gates.append(Gate(id=f"{terminal}{n}", terminal=terminal, widebody=n <= 2, free_from=free_from,
+                          free_until=free_until))
     gates.append(Gate(id="R1", terminal="R", widebody=True, free_from=-999, free_until=10_000, remote=True))
     ramp_closed = weather_close if (brief and (brief.thunderstorm or brief.convective_nearby) and weather_close > -999) else -999
 
@@ -375,7 +427,7 @@ def build_scenario(row: pd.Series, weather_mode: WeatherMode = "HISTORICAL") -> 
                            tobt=int(nl.SD_MIN) - sibt_min, source="DOT")
     else:
         next_leg = NextLeg(flight=f"{row.AIRLINE}{rng.randint(100, 2999)}", destination="(next leg)",
-                           tobt=int(cal_turn[wake]) + rng.randint(5, 30), source="SIM")
+                           tobt=base_turnaround + rng.randint(5, 30), source="SIM")
 
     conns = flights[(flights.ORIGIN_AIRPORT == dest) & (flights.AIRLINE == row.AIRLINE) & (flights.MONTH == row.MONTH)
                     & (flights.DAY == row.DAY)]
@@ -386,10 +438,15 @@ def build_scenario(row: pd.Series, weather_mode: WeatherMode = "HISTORICAL") -> 
 
     # --- fuel --------------------------------------------------------------------
     alt, alt_nm = _nearest_alternate(dest)
-    frf = FINAL_RESERVE_MIN * ac["hold_kg_min"]
+    frf = LIMITS.final_reserve_min * hold_kg_min
     alt_fuel = int((alt_nm / ac["cruise_nm_min"] + 12) * ac["cruise_kg_min"])  # + missed approach & approach
-    extra_min = rng.randint(14, 50)
-    fob = frf + alt_fuel + extra_min * ac["hold_kg_min"]
+    trip_fuel = int(row.DISTANCE) * 0.869 / ac["cruise_nm_min"] * ac["cruise_kg_min"]  # statute miles to NM
+    contingency = int(trip_fuel * LIMITS.contingency_pct / 100)
+    fob = int(frf) + alt_fuel + contingency + round(LIMITS.spare_fuel_min * hold_kg_min)
+    shift_min = LIMITS.ground_shift_h * 60
+    first_change = (SHIFT_CHANGE_HOUR * 60 - sibt_min) % shift_min  # the next shift change, relative to SIBT
+    due = max(eta, 0)
+    crew_shift_end = first_change + ((due - first_change) // shift_min + 1) * shift_min
 
     return Scenario(
         row_index=int(row.get("index", row.name)), flight=f"{row.AIRLINE}{int(row.FLIGHT_NUMBER)}",
@@ -399,12 +456,14 @@ def build_scenario(row: pd.Series, weather_mode: WeatherMode = "HISTORICAL") -> 
         scheduled_arrival_hhmm=f"{int(row.SCHEDULED_ARRIVAL) % 2400:04d}", weather_delay_min=weather_delay,
         late_aircraft_delay_min=late, distance_mi=int(row.DISTANCE),
         weather_mode=weather_mode, weather=brief, weather_at_destination=dest_wx, weather_attribution=attribution,
-        imc=imc, airport_icao=ref.icao if ref else dest,
-        wake=wake, aircraft_type=ac["type"], eta_min=eta, fob_at_eta_kg=int(fob),
-        hold_burn_kg_per_min=ac["hold_kg_min"], final_reserve_kg=int(frf), alternate=alt, alternate_fuel_kg=alt_fuel,
+        imc=imc, airport_icao=ref.icao if ref else dest, airport_limits=limits,
+        wake=wake, aircraft_type=ac["type"], eta_min=eta, fob_at_eta_kg=fob,
+        hold_burn_kg_per_min=hold_kg_min, final_reserve_kg=int(frf), alternate=alt, alternate_fuel_kg=alt_fuel,
+        contingency_fuel_kg=contingency, flight_duty_end_min=_flight_duty_end(row, flights),
         connections=connections, runways=runways, taxiway_note=taxiway_note,
-        gates=gates, scheduled_gate=gates[2].id, turnaround_min=turnaround, deice_required=deice,
-        ramp_closed_until=ramp_closed, crew_shift_end_min=max(eta, 0) + rng.randint(55, 110), next_leg=next_leg,
+        gates=gates, scheduled_gate=gates[scheduled].id, turnaround_min=turnaround, deice_required=deice,
+        ramp_closed_until=ramp_closed, crew_shift_end_min=crew_shift_end,
+        decision_time_min=eta - rng.randint(10, 40), next_leg=next_leg,
     )
 
 

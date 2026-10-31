@@ -36,7 +36,7 @@ from constraints import (
 )
 from escalation import Alarm, dispatch
 from monitoring import CallMetric, summarise
-from scenario import MIN_FUEL_ADVISORY_MARGIN_MIN, Scenario
+from scenario import LIMITS, MIN_FUEL_ADVISORY_MARGIN_MIN, Scenario
 
 MAX_TURNS = 3
 LOG_DIR = Path(__file__).parent / "logs"
@@ -398,6 +398,8 @@ class NegotiationSession:
             "weather_delay_min": s.weather_delay_min, "late_aircraft_delay_min": s.late_aircraft_delay_min,
             "weather_mode": s.weather_mode, "weather_attribution": s.weather_attribution,
             "weather_sources": [x.model_dump() for x in (s.weather.sources if s.weather else [])],
+            "limits_source": {"workbook": LIMITS.source, "sha256": LIMITS.sha256,
+                              "airport": s.airport_limits.model_dump()},
             "autonomy": self.autonomy.value, "max_turns": MAX_TURNS,
             "models": {k: a.model for k, a in self.agents.items()}})
         turn = 0
@@ -539,7 +541,7 @@ class NegotiationSession:
         pm, gm = full["PILOT"].metrics, full["GROUND"].metrics
         risks = []
         if pm.get("fuel_margin_min", 99) < MIN_FUEL_ADVISORY_MARGIN_MIN:
-            risks.append(f"Fuel margin {pm['fuel_margin_min']} min above FRF+ALTN: crew will declare MINIMUM FUEL.")
+            risks.append(f"Fuel margin {pm['fuel_margin_min']} min above FRF+ALTN+contingency: crew will declare MINIMUM FUEL.")
         if pm.get("holding_min", 0) > 0 and "MOD" in (pm.get("hold_turbulence"), pm.get("hold_icing")):
             risks.append(f"{pm['holding_min']} min holding in reported MOD turbulence/icing.")
         if gm.get("crew_overtime_min", 0) > 0:

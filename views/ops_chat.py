@@ -170,12 +170,12 @@ INTROS = {
             "separation**, runway closures and crosswind/tailwind limits, **taxiway blockages**, and **maximising "
             "arrival throughput**. I can test any landing slot against separation and list conflict-free AMAN "
             "slots. Fuel and passengers are the Captain's; stands and crew are AOCC's, and I'll hand those over."),
-    "PILOT": ("**{name}**, flight deck. I **preserve fuel reserves** (never below final reserve plus alternate), "
-              "keep the flight safe, **minimise time in turbulence and icing** using PIREPs, and **protect "
+    "PILOT": ("**{name}**, flight deck. I **preserve fuel reserves** (never below final reserve plus alternate and "
+              "contingency), stay inside crew duty limits, keep the flight safe, **minimise time in turbulence and icing** using PIREPs, and **protect "
               "passengers' connections**. I can give you FMS fuel predictions for any landing time and check a plan "
               "against my limits. Runway sequencing is ATC's; stands are AOCC's."),
     "GROUND": ("**{name}**, Airport Operations Control Centre. I **optimise stand utilisation**, keep **ground crew "
-               "out of overtime** and inside the legal duty cap, and **minimise turnaround delay** and knock-on to "
+               "out of overtime**, give proper gate-change notice, and **minimise turnaround delay** and knock-on to "
                "the next departure. I can check any plan against stand, crew and turnaround limits. Landing times "
                "are ATC's; fuel is the Captain's."),
 }

@@ -63,7 +63,7 @@ def plan_emergency(s: Scenario, kind: EmergencyKind, reason: str = "") -> Emerge
 
     efob = s.fuel_at(slot)
     fuel_status = ("MAYDAY FUEL (below final reserve)" if efob < s.final_reserve_kg else
-                   "MINIMUM FUEL (below FRF + ALTN)" if efob < s.min_landing_fuel_kg else "fuel OK")
+                   "MINIMUM FUEL (below FRF + ALTN + contingency)" if efob < s.min_landing_fuel_kg else "fuel OK")
     window = max(WAKE_SEPARATION_MIN.values()) + 1
     displaced = [f"{t.callsign} ({s.clock(t.t)})" for t in rwy.traffic if abs(t.t - slot) < window]
 

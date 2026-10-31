@@ -6,3 +6,4 @@ pydantic>=2
 requests
 timezonefinder
 matplotlib
+openpyxl

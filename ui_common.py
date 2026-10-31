@@ -270,7 +270,7 @@ def timeline(s: Scenario, final=None, reference=None) -> go.Figure:
             fig.add_trace(go.Scatter(x=[t.t for t in pts], y=[r.id] * len(pts), mode="markers",
                                      name="DOT 2015 arrival" if src == "DOT" else "simulated traffic",
                                      legendgroup=src, showlegend=r is s.runways[0],
-                                     marker=dict(size=[12 if t.wake == "HEAVY" else 8 for t in pts], color=colour),
+                                     marker=dict(size=[12 if t.wake in ("SUPER", "HEAVY") else 8 for t in pts], color=colour),
                                      text=[f"{t.callsign} {t.wake} {s.clock(t.t)}" for t in pts], hoverinfo="text"))
     fig.add_vline(x=s.eta_min, line_dash="dot", line_color="#4c78a8", annotation_text="ELDT")
     fig.add_vline(x=s.latest_safe_landing, line_dash="dash", line_color="#d62728", annotation_text="fuel limit")

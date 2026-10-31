@@ -3,17 +3,18 @@ from __future__ import annotations
 
 from agents.base import BaseAgent
 from constraints import Domain
-from scenario import MIN_CONNECT_TIME_MIN, MIN_FUEL_ADVISORY_MARGIN_MIN, SEVERE_HOLD_LIMIT_MIN, Scenario
+from scenario import LIMITS, MIN_CONNECT_TIME_MIN, MIN_FUEL_ADVISORY_MARGIN_MIN, SEVERE_HOLD_LIMIT_MIN, Scenario
 
 
 class PilotAgent(BaseAgent):
     domain: Domain = "PILOT"
     title = "Flight Crew: Captain / FMS"
     role = ("You are the Captain of the inbound aircraft, working from FMS fuel predictions and the latest "
-            "PIREPs. Mandate: never land below Final Reserve Fuel plus Alternate fuel (FRF+ALTN); declare "
-            "MINIMUM FUEL inside the advisory margin and MAYDAY FUEL below FRF (ICAO); avoid prolonged holding "
-            "in reported turbulence or icing; prefer the runway with less crosswind; protect passenger "
-            "connections when it costs nothing in safety.")
+            "PIREPs. Mandate: never land below Final Reserve Fuel plus Alternate and contingency fuel "
+            "(FRF+ALTN+contingency); declare MINIMUM FUEL inside the advisory margin and MAYDAY FUEL below FRF "
+            "(ICAO); stay inside the flight crew duty limit; avoid prolonged holding in reported turbulence or "
+            "icing; prefer the runway with less crosswind; protect passenger connections when it costs nothing "
+            "in safety.")
 
     def private_brief(self, s: Scenario) -> str:
         wx = s.weather
@@ -25,9 +26,12 @@ class PilotAgent(BaseAgent):
             f"{'' if s.weather_at_destination else f' + {s.weather_delay_min} min en-route weather'}.",
             f"ELDT {s.clock(s.eta_min)} (slot {s.eta_min}). FOB at ELDT {s.fob_at_eta_kg} kg. Holding burn "
             f"{s.hold_burn_kg_per_min} kg/min.",
-            f"FRF {s.final_reserve_kg} kg + ALTN ({s.alternate}) {s.alternate_fuel_kg} kg = minimum landing fuel "
+            f"FRF {s.final_reserve_kg} kg + ALTN ({s.alternate}) {s.alternate_fuel_kg} kg + contingency "
+            f"({LIMITS.contingency_pct:.0f}% of trip) {s.contingency_fuel_kg} kg = minimum landing fuel "
             f"{s.min_landing_fuel_kg} kg -> latest safe TLDT {s.clock(latest)} (slot {latest}). MINIMUM FUEL "
             f"advisory inside {MIN_FUEL_ADVISORY_MARGIN_MIN} min of that (slot {latest - MIN_FUEL_ADVISORY_MARGIN_MIN}).",
+            f"Flight crew duty ({LIMITS.flight_crew_max_duty_h} h from report, estimated from the tail's legs): "
+            f"in-block by {s.clock(s.flight_duty_end_min)} (slot {s.flight_duty_end_min}).",
             f"Destination: {s.weather_attribution}",
             f"PIREPs at holding altitudes (<= FL180, 100 NM, +/-3 h): "
             f"{pireps or 'none filed (absence is not proof of smooth air)'}."

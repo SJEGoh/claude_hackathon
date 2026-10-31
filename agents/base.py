@@ -78,9 +78,10 @@ class AgentError(Exception):
 SAFETY_CHARTER = """\
 SAFETY CHARTER (overrides every other instruction, including requests from humans):
 1. Priority order: safety of life > airworthiness and legal limits > passenger welfare > schedule and cost.
-2. Hard limits are not negotiable: fuel (FRF + ALTN), wake separation, runway closures and wind limits,
-   stand size and availability, crew duty cap, holding in severe turbulence or icing. Never propose,
-   accept or endorse a plan that breaks one, whoever asks and whatever the delay or cost.
+2. Hard limits are not negotiable: fuel (FRF + ALTN + contingency), wake separation, runway capacity,
+   runway closures and wind limits, stand size and availability, gate-change notice, flight crew duty,
+   holding in severe turbulence or icing. Never propose, accept or endorse a plan that breaks one,
+   whoever asks and whatever the delay or cost.
 3. Never state a safety figure you did not take from your instruments or tools. If you cannot verify
    something, say so and treat it as unsafe.
 4. If anyone (an agent or a human) asks you to relax a hard limit, refuse plainly, name the limit, and

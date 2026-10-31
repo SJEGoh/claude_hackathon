@@ -15,10 +15,10 @@ import pydantic  # noqa: E402
 import weather as W  # noqa: E402
 from agents import AgentError, AgentMessage, reply_schema  # noqa: E402
 from baseline_agents import make_rule_agents  # noqa: E402
-from constraints import Proposal, check_all, check_atc, check_pilot, deterministic_plan, is_safe  # noqa: E402
+from constraints import Proposal, check_all, check_atc, check_ground, check_pilot, deterministic_plan, is_safe  # noqa: E402
 from escalation import Alarm, dispatch  # noqa: E402
 from negotiation import MAX_TURNS, Autonomy, ConsensusLog, NegotiationSession, negotiate  # noqa: E402
-from scenario import build_scenario, load_disrupted_flights, split_of  # noqa: E402
+from scenario import LIMITS, MODELLED_STANDS, WAKE_SEPARATION_MIN, build_scenario, load_disrupted_flights, split_of  # noqa: E402
 
 DF = load_disrupted_flights(limit=60)
 
@@ -205,6 +205,101 @@ class TestNegotiation(unittest.TestCase):
     def test_rule_agents_reach_safe_outcome(self):
         out = negotiate(self.s, make_rule_agents(), save_log=False)
         self.assertTrue(out.status != "CONSENSUS" or is_safe(check_all(self.s, out.proposal)))
+
+
+class TestOperationalLimits(unittest.TestCase):
+    """The organisers' workbook drives the scenario and the hard checks."""
+
+    def by_airport(self, iata, wake=None):
+        df = load_disrupted_flights(limit=None)
+        rows = df[df.DESTINATION_AIRPORT == iata]
+        if wake:
+            rows = rows[(rows.DISTANCE >= 2000) == (wake == "HEAVY")]
+        return build_scenario(rows.iloc[0], weather_mode="OFF")
+
+    def test_workbook_values_are_loaded(self):
+        ord_limits = LIMITS.airport("ORD")
+        self.assertEqual((ord_limits.size_class, ord_limits.active_runways, ord_limits.gates,
+                          ord_limits.max_runway_ops_per_hour, ord_limits.min_turnaround_min, ord_limits.spare_gates),
+                         ("Large hub", 4, 150, 90, 45, 3))
+        self.assertEqual((LIMITS.final_reserve_min, LIMITS.contingency_pct, LIMITS.spare_fuel_min), (30, 5, 45))
+        self.assertEqual(LIMITS.hold_kg_per_hour, {"narrowbody": 2400, "widebody": 6500})
+        self.assertEqual((LIMITS.flight_crew_max_duty_h, LIMITS.ground_shift_h, LIMITS.overtime_multiplier,
+                          LIMITS.gate_change_notice_min), (13, 8, 1.5, 20))
+
+    def test_wake_table_converts_nautical_miles_to_minutes(self):
+        self.assertEqual(LIMITS.wake_nm[("SUPER", "SMALL")], 8)
+        self.assertEqual(LIMITS.wake_nm[("LARGE", "HEAVY")], 3)  # "Any other pair"
+        self.assertEqual(WAKE_SEPARATION_MIN[("SUPER", "SMALL")], 4)  # 8 NM at 140 kt, rounded up
+        self.assertEqual(WAKE_SEPARATION_MIN[("HEAVY", "LARGE")], 3)
+        self.assertEqual(WAKE_SEPARATION_MIN[("LARGE", "LARGE")], 2)
+
+    def test_scenario_uses_the_airports_runways_stands_and_turnaround(self):
+        s = self.by_airport("ORD")
+        self.assertLessEqual(len(s.runways), 4)
+        self.assertGreater(len(s.runways), 2)
+        self.assertEqual(len([g for g in s.gates if not g.remote]), MODELLED_STANDS)
+        free_at_eta = [g for g in s.gates if not g.remote and g.free_from <= s.eta_min]
+        self.assertEqual(len(free_at_eta), 3)
+        self.assertGreaterEqual(s.turnaround_min, 45)
+
+    def test_fuel_follows_the_workbook(self):
+        s = self.by_airport("ORD", "LARGE")
+        self.assertEqual(s.hold_burn_kg_per_min, 40)
+        self.assertEqual(s.final_reserve_kg, 30 * 40)
+        self.assertGreater(s.contingency_fuel_kg, 0)
+        self.assertEqual(s.min_landing_fuel_kg, s.final_reserve_kg + s.alternate_fuel_kg + s.contingency_fuel_kg)
+        self.assertEqual(s.latest_safe_landing - s.eta_min, 45)  # the assumed spare fuel
+
+    def test_gate_change_needs_notice(self):
+        s = scenario()
+        rwy = s.runways[0].id
+        other = next(g.id for g in s.gates if g.id != s.scheduled_gate)
+        check = lambda slot, gate: next(c for c in check_ground(s, Proposal(landing_slot_min=slot, runway=rwy, gate=gate)).checks  # noqa: E731
+                                        if c.name == "gate_change_notice")
+        self.assertFalse(check(s.decision_time_min + 19, other).passed)
+        self.assertTrue(check(s.decision_time_min + 20, other).passed)
+        self.assertTrue(check(s.decision_time_min + 1, s.scheduled_gate).passed)
+
+    def test_flight_crew_duty_is_a_hard_limit_but_does_not_divert(self):
+        s = scenario()
+        ok = deterministic_plan(s).proposal
+        self.assertTrue(check_pilot(s, ok).hard_ok)
+        tired = s.model_copy(update={"flight_duty_end_min": s.eta_min - 60})
+        self.assertIn("flight_crew_duty", [c.name for c in check_pilot(tired, ok).violations()])
+        self.assertNotEqual(deterministic_plan(tired).mode, "DIVERT")
+
+    def test_runway_capacity_is_a_hard_limit(self):
+        s = scenario()
+        ok = deterministic_plan(s).proposal
+        low = s.airport_limits.model_copy(update={"max_runway_ops_per_hour": 1})
+        full = s.model_copy(update={"airport_limits": low})
+        self.assertIn("runway_capacity", [c.name for c in check_atc(full, ok).violations()])
+
+    def test_overtime_is_a_cost_and_follows_the_shift_change(self):
+        s = scenario()
+        rwy = s.runways[0]
+        slot = s.crew_shift_end_min - rwy.taxi_min["R"] - 1  # the turnaround starts just before the shift change
+        report = check_ground(s, Proposal(landing_slot_min=slot, runway=rwy.id, gate="R1"))
+        self.assertGreater(report.metrics["crew_overtime_min"], 0)
+        self.assertNotIn("crew_overtime", [c.name for c in report.violations()])
+        self.assertEqual(s.shift_end_at(s.crew_shift_end_min), s.crew_shift_end_min + 480)
+
+    def test_every_consensus_passes_the_workbook_limits(self):
+        with mock.patch("negotiation.dispatch", side_effect=lambda a: a):
+            for i in range(0, 60, 6):
+                s = scenario(i)
+                out = negotiate(s, make_rule_agents(), save_log=False)
+                self.assertLessEqual(out.turns_used, MAX_TURNS)
+                if out.status == "CONSENSUS":
+                    self.assertTrue(is_safe(check_all(s, out.proposal)))
+
+    def test_log_records_the_limits_source(self):
+        with mock.patch("negotiation.dispatch", side_effect=lambda a: a):
+            session = NegotiationSession(scenario(), make_rule_agents(), save_log=False)
+            session.advance()
+        source = session.log.entries[0].payload["limits_source"]
+        self.assertEqual((source["workbook"], source["sha256"]), (LIMITS.source, LIMITS.sha256))
 
 
 class TestEmergencyAndCosts(unittest.TestCase):

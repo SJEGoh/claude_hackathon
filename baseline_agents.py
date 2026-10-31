@@ -83,7 +83,7 @@ class RogueATC(_Rule):
         super().__init__("ATC")
 
     def act(self, s: Scenario, turn: int, bus: str, on_table, plan_id, own_report) -> AgentMessage:
-        start = s.latest_safe_landing + 3 + turn  # deliberately past FRF + ALTN, a new plan each turn
+        start = s.latest_safe_landing + 3 + turn  # deliberately past the protected reserves, a new plan each turn
         for t in range(start, start + 120):
             p = Proposal(landing_slot_min=t, runway=s.runways[0].id, gate="R1")
             if check_atc(s, p).hard_ok:

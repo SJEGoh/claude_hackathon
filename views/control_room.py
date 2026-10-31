@@ -108,7 +108,7 @@ m[1].metric("SIBT", s.clock(0), s.date, delta_color="off")
 m[2].metric("WEATHER_DELAY", f"{s.weather_delay_min} min")
 m[3].metric("LATE_AIRCRAFT", f"{s.late_aircraft_delay_min} min")
 m[4].metric("ELDT", s.clock(s.eta_min), f"slot {s.eta_min}", delta_color="off")
-m[5].metric("Latest safe TLDT", s.clock(s.latest_safe_landing), "FRF+ALTN", delta_color="off")
+m[5].metric("Latest safe TLDT", s.clock(s.latest_safe_landing), "FRF+ALTN+cont.", delta_color="off")
 (st.warning if s.weather_at_destination else st.info)(s.weather_attribution, icon="🌦️")
 
 tab_neg, tab_wx, tab_mon, tab_stress, tab_batch, tab_eda = st.tabs(
