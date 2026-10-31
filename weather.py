@@ -77,9 +77,9 @@ def _fetch(source: str, url: str, params: dict, cache_key: str, max_age_s: Optio
     meta = path.with_suffix(".json")
     full_url = requests.Request("GET", url, params=params).prepare().url or url
     if path.exists() and meta.exists():
-        m = json.loads(meta.read_text())
+        m = json.loads(meta.read_text(encoding="utf-8"))
         if max_age_s is None or time.time() - m["epoch"] < max_age_s:
-            body = path.read_text()
+            body = path.read_text(encoding="utf-8")
             return body, SourceRecord(source=source, url=full_url, fetched_at=m["fetched_at"],
                                       sha256=m["sha256"], cached=True, ok=True)
     try:
@@ -88,8 +88,8 @@ def _fetch(source: str, url: str, params: dict, cache_key: str, max_age_s: Optio
         body = r.text
     except requests.RequestException as e:
         if path.exists():  # stale cache beats nothing, and we say so
-            m = json.loads(meta.read_text())
-            return path.read_text(), SourceRecord(source=source, url=full_url, fetched_at=m["fetched_at"],
+            m = json.loads(meta.read_text(encoding="utf-8"))
+            return path.read_text(encoding="utf-8"), SourceRecord(source=source, url=full_url, fetched_at=m["fetched_at"],
                                                   sha256=m["sha256"], cached=True, ok=True,
                                                   note=f"refresh failed ({type(e).__name__}); using stale cache")
         return None, SourceRecord(source=source, url=full_url, fetched_at="", sha256="", cached=False, ok=False,
@@ -97,8 +97,8 @@ def _fetch(source: str, url: str, params: dict, cache_key: str, max_age_s: Optio
     digest = hashlib.sha256(body.encode()).hexdigest()
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body)
-    meta.write_text(json.dumps({"fetched_at": now, "epoch": time.time(), "sha256": digest, "url": full_url}))
+    path.write_text(body, encoding="utf-8")
+    meta.write_text(json.dumps({"fetched_at": now, "epoch": time.time(), "sha256": digest, "url": full_url}), encoding="utf-8")
     return body, SourceRecord(source=source, url=full_url, fetched_at=now, sha256=digest, cached=False, ok=True)
 
 
@@ -129,8 +129,8 @@ def _ourairports(kind: str) -> list[dict]:
         REF.mkdir(exist_ok=True)
         r = requests.get(OURAIRPORTS[kind], timeout=60, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
-        path.write_text(r.text)
-    with path.open(newline="") as fh:
+        path.write_text(r.text, encoding="utf-8")
+    with path.open(newline="", encoding="utf-8-sig") as fh:
         return list(csv.DictReader(fh))
 
 

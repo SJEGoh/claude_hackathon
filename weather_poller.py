@@ -17,7 +17,7 @@ LIVE_INDEX = W.CACHE / "live_index.json"
 
 
 def poll(airports: list[str]) -> dict:
-    index = json.loads(LIVE_INDEX.read_text()) if LIVE_INDEX.exists() else {}
+    index = json.loads(LIVE_INDEX.read_text(encoding="utf-8")) if LIVE_INDEX.exists() else {}
     for iata in airports:
         ref = W.airport_ref(iata)
         if ref is None:
@@ -30,7 +30,7 @@ def poll(airports: list[str]) -> dict:
                        "notes": [s.note for s in brief.sources if s.note]}
         print(f"{index[iata]['polled_at']} {brief.summary()}")
     W.CACHE.mkdir(exist_ok=True)
-    LIVE_INDEX.write_text(json.dumps(index, indent=1))
+    LIVE_INDEX.write_text(json.dumps(index, indent=1), encoding="utf-8")
     return index
 
 

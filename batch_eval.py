@@ -109,8 +109,8 @@ def main() -> None:
     df.to_csv(base.with_suffix(".csv"), index=False)
     report = (f"# Batch evaluation: {args.agents} agents, {args.split} split\n\n{datetime.now():%Y-%m-%d %H:%M}, "
               f"model {args.model if args.agents == 'claude' else 'n/a'}, seed {args.seed}\n\n{summarise(df)}\n")
-    base.with_suffix(".md").write_text(report)
-    base.with_suffix(".json").write_text(json.dumps(vars(args)))
+    base.with_suffix(".md").write_text(report, encoding="utf-8")
+    base.with_suffix(".json").write_text(json.dumps(vars(args)), encoding="utf-8")
     print("\n" + report + f"\nSaved {base}.csv/.md")
 
 

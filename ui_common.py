@@ -355,7 +355,7 @@ def render_outcome(s: Scenario, out) -> None:
                        "where every weight is varied ±50%. Weights and sources: costs.py / Control room sidebar.")
     if out.log_path:
         st.download_button(f"Download consensus log (hash chain {'verified ✅' if out.log_verified else 'BROKEN ❌'})",
-                           Path(out.log_path).read_text(), file_name=Path(out.log_path).name,
+                           Path(out.log_path).read_text(encoding="utf-8"), file_name=Path(out.log_path).name,
                            mime="application/jsonl", key=f"dl_{out.log_path}")
 
 

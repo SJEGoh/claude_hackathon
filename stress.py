@@ -457,4 +457,4 @@ if __name__ == "__main__":
     print(text)
     out = Path(__file__).parent / "eval" / f"stress_{datetime.now():%Y%m%d-%H%M%S}.md"
     out.parent.mkdir(exist_ok=True)
-    out.write_text(text + "\n")
+    out.write_text(text + "\n", encoding="utf-8")

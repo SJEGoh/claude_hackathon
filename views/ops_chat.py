@@ -172,7 +172,7 @@ def post(ch: str, item: dict, log_line: str | None = None) -> None:
         S.oc_group_log.append(log_line)
     if item["t"] == "msg":
         CHAT_LOG.parent.mkdir(exist_ok=True)
-        with CHAT_LOG.open("a") as f:
+        with CHAT_LOG.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "channel": ch,
                                 "who": item["who"], "text": item["text"]}) + "\n")
 
