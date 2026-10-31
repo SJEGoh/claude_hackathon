@@ -13,18 +13,19 @@ import anthropic
 import streamlit as st
 
 import config  # noqa: F401  (loads .env)
-from agents import DEFAULT_MODEL, ROLES, make_agents, render_brief, render_message
+from agents import DEFAULT_MODEL, ROLES, render_brief, render_message
+from agents.base import SAFETY_CHARTER
 from agents.chief import CHIEF_SYSTEM, CHIEF_TOOLS
 from agents.conversation import CHAT_STYLE, Conversation, converse, specialist_tools
-from baseline_agents import make_rule_agents
 from monitoring import summarise
 from negotiation import Autonomy, NegotiationSession
 from scenario import load_disrupted_flights
-from ui_common import AVATARS, NAMES, ROOT, get_scenario, plan_text, render_event, render_outcome, timeline
+from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, get_scenario, hero, make_engine_agents,
+                       render_event, render_outcome, timeline)
 
 CHANNELS = ["group", "MODERATOR", "ATC", "PILOT", "GROUND"]
-LABEL = {"group": "👥 #ops-team", "MODERATOR": "🧭 Chief of Staff", "ATC": "🗼 ATC", "PILOT": "🧑‍✈️ Flight Crew",
-         "GROUND": "🧳 AOCC"}
+LABEL = {"group": "👥 #ops-team", "MODERATOR": "✉️ Chief of Staff", "ATC": "✉️ ATC", "PILOT": "✉️ Flight Crew",
+         "GROUND": "✉️ AOCC"}  # fixed labels: Streamlit loses a widget whose labels change
 STATUS_ICON = {"idle": "🟢", "working": "🟡", "waiting": "🔴"}
 MENTIONS = {"@atc": "ATC", "@pilot": "PILOT", "@crew": "PILOT", "@captain": "PILOT", "@ground": "GROUND",
             "@aocc": "GROUND", "@chief": "MODERATOR", "@cos": "MODERATOR"}
@@ -56,8 +57,15 @@ with st.sidebar:
     def show_status(agent: str, status: str) -> None:
         S.oc_status[agent] = status
         unread = S.oc_unread.get(agent, 0)
-        roster[agent].caption(f"{STATUS_ICON[status]} {NAMES[agent]} · {status}"
-                              + (f" · ✉️ {unread} new" if unread and agent != S.oc_channel else ""))
+        with roster[agent].container():
+            c1, c2 = st.columns([1, 4], vertical_alignment="center")
+            av = AVATARS[agent]
+            if str(av).endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                c1.image(av, width=34)
+            else:
+                c1.markdown(f"<div style='font-size:24px'>{av}</div>", unsafe_allow_html=True)
+            c2.caption(f"{STATUS_ICON[status]} **{NAMES[agent]}** · {status}"
+                       + (f" · ✉️ {unread} new" if unread and agent != S.oc_channel else ""))
 
     for a in ROLES:
         show_status(a, S.oc_status[a])
@@ -67,7 +75,7 @@ with st.sidebar:
         st.caption("✅ API key loaded from .env" if key_ok else "⚠️ No API key: add it to .env")
         model = st.selectbox("Model", [DEFAULT_MODEL, "claude-sonnet-5-5", "claude-haiku-5-5"])
         effort = st.select_slider("Effort", ["low", "medium", "high"], value="low")
-        engine = st.radio("Negotiation engine", ["Claude agents", "Rule-based (free)"])
+        engine = st.radio("Negotiation engine", ENGINES)
         default_autonomy = st.radio("Default autonomy", [a.value for a in Autonomy], index=1,
                                     format_func=lambda a: a.replace("_", " ").title())
         sound = st.toggle("Audible alarms", value=True)
@@ -113,6 +121,9 @@ def draw(item: dict) -> None:
         render_outcome(s, item["data"])
     elif t == "note":
         st.caption(item["text"])
+        if item.get("jump") and item["jump"] != channel:
+            st.button(f"Open {LABEL[item['jump']]} →", key=f"jump_{id(item)}",
+                      on_click=lambda target=item["jump"]: S.update(oc_channel=target))
 
 
 def post(ch: str, item: dict, log_line: str | None = None) -> None:
@@ -129,6 +140,39 @@ def post(ch: str, item: dict, log_line: str | None = None) -> None:
         with CHAT_LOG.open("a") as f:
             f.write(json.dumps({"ts": datetime.now().isoformat(timespec="seconds"), "channel": ch,
                                 "who": item["who"], "text": item["text"]}) + "\n")
+
+
+# ============================================================================
+# Introductions: every channel opens with its agent(s) saying who they are
+# ============================================================================
+INTROS = {
+    "MODERATOR": ("Hi, I'm **{name}**, your Duty Operations Manager. I coordinate the team below: I find and load "
+                  "disrupted flights from the US DOT 2015 data, run the 3-turn negotiation between ATC, Flight Crew "
+                  "and AOCC, and bring you any decision that needs a human. I have no private instruments, so for "
+                  "specialist figures I ask the specialist. Try: *\"find a weather-delayed flight into ORD\"*."),
+    "ATC": ("**{name}** here, approach and ground movement. I own the landing sequence: **runway wake "
+            "separation**, runway closures and crosswind/tailwind limits, **taxiway blockages**, and **maximising "
+            "arrival throughput**. I can test any landing slot against separation and list conflict-free AMAN "
+            "slots. Fuel and passengers are the Captain's; stands and crew are AOCC's, and I'll hand those over."),
+    "PILOT": ("**{name}**, flight deck. I **preserve fuel reserves** (never below final reserve plus alternate), "
+              "keep the flight safe, **minimise time in turbulence and icing** using PIREPs, and **protect "
+              "passengers' connections**. I can give you FMS fuel predictions for any landing time and check a plan "
+              "against my limits. Runway sequencing is ATC's; stands are AOCC's."),
+    "GROUND": ("**{name}**, Airport Operations Control Centre. I **optimise stand utilisation**, keep **ground crew "
+               "out of overtime** and inside the legal duty cap, and **minimise turnaround delay** and knock-on to "
+               "the next departure. I can check any plan against stand, crew and turnaround limits. Landing times "
+               "are ATC's; fuel is the Captain's."),
+}
+
+
+def intro(agent: str) -> dict:
+    return {"t": "msg", "who": agent, "text": INTROS[agent].format(name=NAMES[agent]), "intro": True}
+
+
+for _ch in CHANNELS:
+    if not S.oc_items[_ch]:
+        S.oc_items[_ch] = ([intro(a) for a in ("MODERATOR", "ATC", "PILOT", "GROUND")] if _ch == "group"
+                           else [intro(_ch)])
 
 
 # ============================================================================
@@ -150,11 +194,13 @@ def system_for(agent: str, ch: str) -> str:
              "sees it.")
     if agent == "MODERATOR":
         return f"{CHIEF_SYSTEM}\n\n{where}"
-    return f"{AGENT_OBJECTS[agent].role}\n\n{CHAT_STYLE}\n\n{where}"
+    return f"{AGENT_OBJECTS[agent].role}\n\n{SAFETY_CHARTER}\n\n{CHAT_STYLE}\n\n{where}"
 
 
 def context_for(agent: str, c: Conversation) -> str:
     parts, s = [], scenario()
+    if not c.history:
+        parts.append(f"## You opened this channel by introducing yourself as:\n{intro(agent)['text']}")
     sig = f"{s.flight}|{s.date}|{s.weather_mode}" if s else "none"
     if sig != c.context_sig:
         c.context_sig = sig
@@ -177,7 +223,26 @@ def context_for(agent: str, c: Conversation) -> str:
     return "\n\n".join(parts)
 
 
-def talk(agent: str, ch: str, text: str, asked_by: str = "the duty officer") -> str:
+def make_refer(from_agent: str, ch: str):
+    """Handoff: from_agent passes a question to the specialist who owns it. One hop only."""
+    def refer(agent: str, question: str) -> str:
+        if agent == from_agent:
+            return "That is your own domain: answer it yourself."
+        target_ch = "group" if ch == "group" else agent  # in a DM, the owner answers in their own DM
+        post(ch, {"t": "note", "text": f"↪️ **{NAMES[from_agent]}** handed this to **{NAMES[agent]}**: _{question}_",
+                  "jump": None if target_ch == ch else target_ch},
+             log_line=f"{from_agent} referred to {agent}: {question}")
+        if target_ch != ch:
+            post(target_ch, {"t": "note", "text": f"↪️ Handed over by **{NAMES[from_agent]}** on your behalf."})
+        answer = talk(agent, target_ch, question, allow_refer=False,
+                      asked_by=f"{NAMES[from_agent]}, on behalf of the duty officer (handoff: answer the duty officer)")
+        if target_ch != ch:  # mirror the answer where the duty officer asked
+            post(ch, {"t": "msg", "who": agent, "text": answer, "meta": f"answered in {LABEL[target_ch]}"})
+        return f"{NAMES[agent]} answered the duty officer: {answer}"
+    return refer
+
+
+def talk(agent: str, ch: str, text: str, asked_by: str = "the duty officer", allow_refer: bool = True) -> str:
     """One chat turn with an agent in a channel; posts its reply there and returns it."""
     c = conv(agent, ch)
     ctx = context_for(agent, c)
@@ -185,10 +250,10 @@ def talk(agent: str, ch: str, text: str, asked_by: str = "the duty officer") -> 
     if agent == "MODERATOR":
         tools, impl = CHIEF_TOOLS, CHIEF_IMPL
     else:
-        tools, impl = specialist_tools(agent, scenario)
+        tools, impl = specialist_tools(agent, scenario, make_refer(agent, ch) if allow_refer else None)
 
     def on_tool(name, args, result):
-        if name not in ("ask_specialist",):  # specialists' answers are posted as their own messages
+        if name not in ("ask_specialist", "refer_to_specialist"):  # those post their own messages
             post(ch, {"t": "tool", "who": agent, "name": name, "args": args})
 
     show_status(agent, "working")
@@ -292,11 +357,11 @@ def t_start_negotiation(autonomy: str) -> str:
         return "No flight loaded. Use find_flights and load_flight first."
     if S.oc_pending is not None:
         return "A negotiation is already paused for a decision; resolve it first."
-    agents = make_rule_agents() if engine.startswith("Rule") else make_agents(model=model, effort=effort)
+    agents = make_engine_agents(engine, model, effort)
     S.oc_session = NegotiationSession(s, agents, Autonomy(autonomy))
     S.oc_outcome = None
     post("group", {"t": "note", "text": f"▶ Negotiation started for {s.flight} · autonomy {autonomy.lower()} · "
-                                        f"{'rule-based agents' if engine.startswith('Rule') else model}"},
+                                        f"{model if engine == ENGINES[0] else engine.lower()}"},
          log_line=f"SYSTEM: negotiation started ({autonomy})")
     return pump()
 
@@ -333,12 +398,17 @@ CHIEF_IMPL = {"find_flights": t_find_flights, "load_flight": t_load_flight, "fli
 # Page
 # ============================================================================
 s = scenario()
+hero("Ops chat · talk to your AI operations team. Group chat in #ops-team, private DMs with each agent.",
+     compact=True)
+if s is not None:
+    fids_board(s, S.oc_outcome, running=S.oc_session is not None and S.oc_outcome is None,
+               pending=S.oc_pending is not None)
 if channel == "group":
-    st.title("👥 #ops-team")
+    st.subheader("👥 #ops-team")
     st.caption("You, the Chief of Staff and the three specialists. Messages go to the Chief unless you @mention "
                "@ATC, @Pilot, @Ground or @Chief. Negotiations run here.")
 else:
-    st.title(LABEL[channel])
+    st.subheader(f"{LABEL[channel]} · {NAMES[channel]}")
     st.caption(f"Private DM with {NAMES[channel]}. Only you and this agent see it; it keeps its own memory "
                "and is aware of what happens in #ops-team.")
 

@@ -4,6 +4,7 @@ Its tools are implemented by the UI layer (views/ops_chat.py) because they drive
 loading flights, running the bounded negotiation, relaying human decisions, and asking specialists.
 It has no private instruments: for specialist facts it asks the specialist.
 """
+from agents.base import SAFETY_CHARTER
 from agents.conversation import CHAT_STYLE, tool
 
 CHIEF_SYSTEM = f"""You are the Chief of Staff (Duty Operations Manager) of an airline/airport A-CDM operations team.
@@ -20,6 +21,8 @@ How you work:
 - When the negotiation pauses for a decision, explain the options in plain words and call
   resolve_decision only with the duty officer's explicit choice, or if they told you to decide.
 - Keep it short: lead with the answer, then the one or two facts that matter.
+
+{SAFETY_CHARTER}
 
 {CHAT_STYLE}"""
 

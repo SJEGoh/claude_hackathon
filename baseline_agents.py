@@ -70,3 +70,35 @@ class RuleResponder(_Rule):
 def make_rule_agents() -> dict:
     atc = RuleATC()
     return {"ATC": atc, "PILOT": RuleResponder("PILOT", atc), "GROUND": RuleResponder("GROUND", atc)}
+
+
+# ============================================================================
+# Safety drill: adversarial agents that try to push an unsafe plan through
+# ============================================================================
+
+class RogueATC(_Rule):
+    """Tables plans that keep wake separation but land after the aircraft's fuel limit."""
+
+    def __init__(self):
+        super().__init__("ATC")
+
+    def act(self, s: Scenario, turn: int, bus: str, on_table, plan_id, own_report) -> AgentMessage:
+        start = s.latest_safe_landing + 3 + turn  # deliberately past FRF + ALTN, a new plan each turn
+        for t in range(start, start + 120):
+            p = Proposal(landing_slot_min=t, runway=s.runways[0].id, gate="R1")
+            if check_atc(s, p).hard_ok:
+                return self._msg("PROPOSE", turn, 0, p, None,
+                                 "DRILL: maximise runway throughput; fuel is the crew's problem.")
+        return self._msg("PROPOSE", turn, 0, Proposal(landing_slot_min=start, runway=s.runways[0].id, gate="R1"),
+                         None, "DRILL")
+
+
+class YesMan(_Rule):
+    """Accepts whatever is on the table: the failure mode the safety engine must catch."""
+
+    def act(self, s: Scenario, turn: int, bus: str, on_table: Proposal, plan_id: int, own_report) -> AgentMessage:
+        return self._msg("ACCEPT", turn, plan_id, on_table, None, "DRILL: accepting to avoid delay.")
+
+
+def make_drill_agents() -> dict:
+    return {"ATC": RogueATC(), "PILOT": YesMan("PILOT"), "GROUND": YesMan("GROUND")}

@@ -194,6 +194,14 @@ class TestNegotiation(unittest.TestCase):
         self.assertIn(data.status, ("FALLBACK", "HUMAN_DECISION"))
         self.assertTrue(any(d.by == "HUMAN" for d in data.decisions))
 
+    def test_safety_drill_rogue_agents_never_get_an_unsafe_plan(self):
+        from baseline_agents import make_drill_agents
+        out = negotiate(self.s, make_drill_agents(), save_log=False)
+        self.assertNotEqual(out.status, "CONSENSUS")
+        self.assertGreaterEqual(out.safety_overrides, 1)
+        self.assertTrue(out.proposal.runway == "DIVERT" or is_safe(check_all(self.s, out.proposal))
+                        or out.reference.mode != "OPTIMISED_SOP")
+
     def test_rule_agents_reach_safe_outcome(self):
         out = negotiate(self.s, make_rule_agents(), save_log=False)
         self.assertTrue(out.status != "CONSENSUS" or is_safe(check_all(self.s, out.proposal)))
