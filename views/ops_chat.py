@@ -1,3 +1,4 @@
+
 """Ops chat: a team chat (#ops-team) plus a private DM with every agent, like a Grok-style bot roster.
 
 - #ops-team: you, the Chief of Staff and the three specialists. Messages go to the Chief unless you
@@ -24,9 +25,9 @@ from escalation import Alarm, dispatch
 from negotiation import Autonomy, ConsensusLog, NegotiationSession
 from scenario import load_disrupted_flights
 import voice
-from baseline_agents import make_drill_agents
-from stress import OutageAgent
-from ui_common import fire_test_alert
+import steer
+from agents import make_agents
+from baseline_agents import make_rule_agents
 from ui_common import (AVATARS, ENGINES, NAMES, ROOT, fids_board, get_scenario, hero, make_engine_agents, weather_card,
                        ratification_form, render_emergency, render_event, render_outcome, timeline)
 
@@ -112,7 +113,7 @@ with st.sidebar:
     st.caption(f"Chat spend this session: ${u['cost_usd']:.3f} · {u['calls']} calls")
     if st.button("🗑️ Clear all chats"):
         for k in list(S.keys()):
-            if k.startswith(("oc_", "demo")):
+            if k.startswith("oc_"):
                 del S[k]
         st.rerun()
 
@@ -351,6 +352,7 @@ def pump(choice=None) -> str:
     sess: NegotiationSession = S.oc_session
     s = scenario()
     note = None if channel == "group" else st.empty()
+    S.oc_running, S.oc_halted = True, False
     ev = sess.advance(choice)
     while True:
         kind, data = ev
@@ -372,6 +374,8 @@ def pump(choice=None) -> str:
             if kind == "brief":
                 show_status("MODERATOR", "idle")
             post("group", {"t": "event", "kind": kind, "data": data, "live": True}, log_line=line)
+        if kind in ("ratification", "decision", "outcome"):
+            S.oc_running = False
         if kind == "ratification":
             S.oc_ratify = data
             for a in ("ATC", "PILOT", "GROUND"):
@@ -410,7 +414,7 @@ def t_start_negotiation(autonomy: str) -> str:
         return "No flight loaded. Use find_flights and load_flight first."
     if S.oc_pending is not None or S.oc_ratify is not None:
         return "A negotiation is already paused for a decision or stakeholder votes; finish that first."
-    eng = S.get("demo_engine") or engine
+    eng = engine
     agents = make_engine_agents(eng, model, effort)
     S.oc_session = NegotiationSession(s, agents, Autonomy(autonomy))
     S.oc_outcome = None
@@ -491,7 +495,7 @@ def fire_emergency(kind: str, reason: str = "", by: str = "duty officer") -> str
         show_status(a, "working")
         post(a, {"t": "msg", "who": a, "text": f"🚨 **{KIND_LABEL[kind]} {s.flight}**. My actions:\n- "
                  + "\n- ".join(plan.actions[a])})
-    if (S.get("demo_engine") or engine) == ENGINES[0]:  # readbacks never delay the plan: it is already on everyone's screen
+    if engine == ENGINES[0]:  # readbacks never delay the plan: it is already on everyone's screen
         with st.spinner("Desks reading back…"):
             rb = readbacks(plan, make_engine_agents(engine, model, effort))
         for a, text in rb.items():
@@ -516,92 +520,67 @@ CHIEF_IMPL = {"compare_plans": t_compare_plans, "declare_emergency": t_declare_e
               "ask_specialist": t_ask_specialist, "get_negotiation_record": t_get_record}
 
 # ============================================================================
-# Guided demo (started from Ops settings): one real DOT flight, every feature, presenter-paced
+# Stop / steer / override a live negotiation
 # ============================================================================
-DEMO_ROW = 115187  # UA1112 IAD->DEN 2015-05-06: WEATHER_DELAY 37, LATE_AIRCRAFT_DELAY 26, real TS + lightning at KDEN
-DEMO_STEPS = [
-    ("Meet the team", "Four independent agents introduced themselves above: three specialists with private data "
-     "and a Chief of Staff who chairs. Each is its own Claude call; none sees another's private data."),
-    ("Brief the Chief of Staff", "We hand the Chief one row of the US DOT 2015 data: UA1112 Dulles to Denver, "
-     "WEATHER_DELAY 37 and LATE_AIRCRAFT_DELAY 26. It loads the flight with the real Denver weather of that evening "
-     "(thunderstorm, lightning, moderate turbulence)."),
-    ("Ask the wrong specialist", "We ask ATC a fuel question. Fuel is the Captain's private data, so ATC hands it "
-     "over instead of guessing (one-hop referral)."),
-    ("Negotiate", "The Chief starts the bounded negotiation: structured messages, every plan checked by the "
-     "deterministic safety engine, under 3 turns, thinking summaries, then the stakeholders ratify. Supervised: "
-     "if the fuel margin is tight you'll be asked to decide."),
-    ("Safety drill: rogue agents", "Adversarial agents try to land past the fuel limit and accept it. The safety "
-     "engine overrides every unsafe ACCEPT and the non-AI planner takes over."),
-    ("AI outage: deterministic fallback", "Every AI agent goes offline (like the 2025 Newark radar outage). The "
-     "independent non-AI planner decides and the alarm goes out."),
-    ("Weather watch and notifications", "The automated checks run on live METAR/TAF/PIREP data and notify only on "
-     "change. We fire a test ALARM: toast, chime, and any phone/Slack/Mac channels set in Ops settings."),
-    ("MAYDAY", "An engine fire on approach. Negotiation is abandoned; the deterministic emergency plan is issued "
-     "in milliseconds and every desk gets its checklist. (In real use: the red button and CONFIRM.)"),
-    ("Wrap-up", "Every step is in a hash-chained consensus log (logs/). Try a DM, or the 🎙️ microphone."),
-]
+def negotiation_active() -> bool:
+    return S.oc_session is not None and S.oc_outcome is None
 
 
-def demo_note(text: str) -> None:
-    post("group", {"t": "note", "text": f"🎬 {text}"}, log_line=f"DEMO: {text}")
-
-
-def demo_negotiate(agents: dict, label: str) -> None:
-    s = scenario()
-    S.oc_session, S.oc_outcome = NegotiationSession(s, agents, Autonomy.AUTONOMOUS), None
-    post("group", {"t": "note", "text": f"▶ {label} for {s.flight} · autonomous"}, log_line=f"SYSTEM: {label}")
+def restart(new_s, agents, autonomy: str, directive: str, label: str) -> None:
+    sess = NegotiationSession(new_s, agents, Autonomy(autonomy))
+    if directive:  # every agent sees it on every turn: the constraint ledger is always on their bus
+        sess.ledger[("CHIEF", "operator_directive")] = f"CHIEF OF STAFF DIRECTIVE (from the duty officer): {directive}"
+        sess.log.add(0, "HUMAN", "operator_directive", {"directive": directive})
+    S.oc_session, S.oc_outcome, S.oc_pending, S.oc_ratify, S.oc_halted = sess, None, None, None, False
+    post("group", {"t": "note", "text": f"↻ {label}"}, log_line=f"SYSTEM: {label}")
     pump()
 
 
-def run_demo_step(i: int, live: bool) -> None:
-    S.oc_channel = "group"
-    title = DEMO_STEPS[i][0]
-    demo_note(f"Demo step {i + 1}/{len(DEMO_STEPS)}: {title}")
-    busy = S.oc_pending is not None or S.oc_ratify is not None
-    if i == 0:
-        demo_note("Four agents introduced themselves above. Next: give the Chief of Staff a DOT record.")
-    elif i == 1:
-        if live:
-            msg = ("Load DOT row 115187 (UA1112, Dulles to Denver, 6 May 2015, WEATHER_DELAY 37 min, "
-                   "LATE_AIRCRAFT_DELAY 26 min) with historical weather and brief the team in three bullets.")
-            post("group", {"t": "msg", "who": "user", "text": msg}, log_line=f"DUTY OFFICER: {msg}")
-            talk("MODERATOR", "group", msg)
-        else:
-            t_load_flight(DEMO_ROW, "HISTORICAL")
-    elif scenario() is None:
-        demo_note("Load the flight first (step 2).")
-    elif i == 2:
-        if live:
-            msg = "@ATC how much fuel will UA1112 have on landing if it takes your earliest conflict-free slot?"
-            post("group", {"t": "msg", "who": "user", "text": msg}, log_line=f"DUTY OFFICER: {msg}")
-            talk("ATC", "group", msg)
-        else:
-            demo_note("Handoffs between agents need Claude agents: switch the demo to live to see this step.")
-    elif i in (3, 4, 5) and busy:
-        demo_note("A decision or vote card is waiting above: answer it, then run this step again.")
+def steer_negotiation(text: str, override: bool = False) -> None:
+    """Chief synthesizes -> firewall (code) -> apply events to the flight -> restart from turn 1."""
+    s = scenario()
+    S.oc_running, S.oc_halted = False, True  # freeze the current negotiation first
+    for a in ("ATC", "PILOT", "GROUND"):
+        show_status(a, "idle")
+    show_status("MODERATOR", "working")
+    chief = make_agents(model=model, effort=effort)["MODERATOR"]
+    with st.spinner("Chief of Staff is synthesizing the new information…"):
+        d = steer.synthesize(chief, s, text, t_get_record())
+    if d.emergency != "NONE":
+        show_status("MODERATOR", "idle")
+        fire_emergency(d.emergency, d.summary, by="duty officer (steer)")
         return
-    elif i == 3:
-        if live:
-            msg = "Run the negotiation for UA1112, supervised."
-            post("group", {"t": "msg", "who": "user", "text": msg}, log_line=f"DUTY OFFICER: {msg}")
-            talk("MODERATOR", "group", msg)
-        else:
-            t_start_negotiation("SUPERVISED")
-    elif i == 4:
-        demo_negotiate(make_drill_agents(), "Safety drill: rogue agents")
-    elif i == 5:
-        demo_negotiate({k: OutageAgent(k) for k in ("ATC", "PILOT", "GROUND")}, "AI outage drill")
-    elif i == 6:
-        sent = fire_test_alert()
-        import watch as _watch
-        active = _watch.active_alerts()
-        demo_note("Test ALARM fired" + (f" to {', '.join(sent)}" if sent else " (screen only)") + ". Live watch now: "
-                  + ("; ".join(f"{a.airport} {a.title} ({a.severity})" for a in active[:4]) or "all clear") + ".")
-    elif i == 7:
-        post("group", {"t": "msg", "who": "user", "text": "🚨 **MAYDAY CONFIRMED**: Technical failure (engine fire)"},
-             log_line="DUTY OFFICER: MAYDAY TECHNICAL engine fire")
-        fire_emergency("TECHNICAL", "engine fire on approach")
-    S.demo["step"] = i + 1
+    accepted, refused, notes = steer.firewall(s, d)
+    if refused:
+        with st.spinner("Safety firewall refused part of it: the Chief is explaining…"):
+            r = steer.explain_refusal(chief, text, refused)
+        show_status("MODERATOR", "waiting")
+        post("group", {"t": "note", "text": "🛡️ **Safety firewall refused** this: it would relax "
+                       + ", ".join(steer.LIMIT_LABEL[x] for x in refused) + ". The negotiation stays stopped."},
+             log_line=f"FIREWALL refused relaxing {refused}")
+        post("group", {"t": "msg", "who": "MODERATOR", "text": f"**{r.header}.** {r.explanation}\n\n"
+                       f"Safe alternative you can send: _{r.safe_alternative}_"},
+             log_line=f"MODERATOR: {r.header}: {r.explanation} Alternative: {r.safe_alternative}")
+        return
+    new_s = steer.apply(s, accepted, d.summary)
+    S.oc_scenario = new_s
+    applied = [steer.describe(new_s, e) for e in accepted]
+    directive = d.summary + (" Applied: " + "; ".join(applied) + "." if applied else "") + "".join(
+        f" {g.agent}: {g.instruction}" for g in d.guidance)
+    show_status("MODERATOR", "idle")
+    post("group", {"t": "msg", "who": "MODERATOR", "text": f"🧭 **New information synthesized.** {d.summary}"
+                   + ("\n\n**Applied to the flight (the safety checks now enforce it):**\n- " + "\n- ".join(applied)
+                      if applied else "")
+                   + ("\n\n**Guidance:**\n- " + "\n- ".join(f"{g.agent}: {g.instruction}" for g in d.guidance)
+                      if d.guidance else "")
+                   + (f"\n\n_Ignored: {'; '.join(notes)}_" if notes else "")},
+         log_line=f"MODERATOR directive: {directive}")
+    if override:
+        restart(new_s, make_rule_agents(), "AUTONOMOUS", directive,
+                "Override: the deterministic layer decides on the updated flight (no AI)")
+    else:
+        restart(new_s, make_engine_agents(engine, model, effort), default_autonomy, directive,
+                "Negotiation restarted from turn 1 with the new information")
 
 
 # ============================================================================
@@ -612,26 +591,6 @@ hero(compact=True)
 if s is not None:
     fids_board(s, S.oc_outcome, emergency=S.oc_emergency, running=S.oc_session is not None and S.oc_outcome is None,
                pending=S.oc_pending is not None or S.oc_ratify is not None)
-if S.get("demo"):
-    i, live = S.demo["step"], S.demo["mode"] == "live"
-    with st.container(border=True):
-        if i >= len(DEMO_STEPS):
-            st.markdown("🎬 **Guided demo complete.**")
-            if st.button("✖ Close demo"):
-                S.pop("demo", None), S.pop("demo_engine", None)
-                st.rerun()
-        else:
-            title, explain = DEMO_STEPS[i]
-            st.markdown(f"🎬 **Guided demo · step {i + 1} of {len(DEMO_STEPS)}: {title}** "
-                        f"· {'live Claude agents' if live else 'deterministic (free)'}")
-            st.caption(explain)
-            b1, b2, b3, _ = st.columns([1.3, 1, 1, 3])
-            b1.button("▶ Run this step", type="primary", key="demo_run", on_click=lambda: S.update(demo_go=True))
-            b2.button("⏭ Skip", key="demo_skip", on_click=lambda: S.demo.update(step=i + 1))
-            if b3.button("✖ End demo", key="demo_end"):
-                S.pop("demo", None), S.pop("demo_engine", None)
-                st.rerun()
-
 if channel == "group":
     st.subheader("👥 #ops-team")
     st.caption("You, the Chief of Staff and the three specialists. Messages go to the Chief unless you @mention "
@@ -710,9 +669,7 @@ if S.get("mayday_request"):
         fire_emergency(req_m["kind"], req_m["reason"])
         st.rerun()
 
-if S.pop("demo_go", False) and S.get("demo"):
-    run_demo_step(S.demo["step"], S.demo["mode"] == "live")
-    st.rerun()
+demo_prompt = S.pop("demo_prompt", None)  # sent by the Demo button in Ops settings
 
 # Voice: talk to the agents (recorded in the browser, transcribed locally with Whisper)
 voice_text = None
@@ -746,9 +703,50 @@ else:
             if not voice_text:
                 st.toast("Didn't catch that: try again a little closer to the mic.", icon="🎙️")
 
+steer_mode = "Ask"
+if channel == "group":  # always on screen in the group chat
+    with st.container(border=True):
+        LABELS = {"Steer": "🧭 Steer: re-plan with this", "Ask": "💬 Ask: just chat",
+                  "Override": "⛔ Override: deterministic layer decides"}
+        if S.oc_scenario is None:
+            c1, c2 = st.columns([3, 1], vertical_alignment="center")
+            c1.markdown("⚪ **No flight loaded.** Ask the Chief of Staff to load one; then you can stop or steer "
+                        "its negotiation from here at any time.")
+            c2.button("⏹ Stop", width="stretch", disabled=True, key="oc_stop_idle")
+        elif S.get("oc_halted"):
+            st.markdown("⏸️ **Negotiation stopped.** Type what changed below and send it as **Steer** (the Chief "
+                        "synthesizes it and restarts the negotiation), or:")
+            h1, h2, _ = st.columns([1, 1.6, 3])
+            h1.button("▶ Resume", on_click=lambda: S.update(oc_halted=False, oc_running=True))
+            h2.button("⛔ Deterministic layer decides", on_click=lambda: S.update(oc_override_now=True))
+            steer_mode = st.segmented_control("When I send a message", list(LABELS), default="Steer",
+                                              key="oc_send_mode_live", format_func=LABELS.get) or "Steer"
+        elif negotiation_active():
+            c1, c2 = st.columns([3, 1], vertical_alignment="center")
+            c1.markdown("🟢 **Live negotiation.** Something changed? Stop it, or type it below to steer.")
+            c2.button("⏹ Stop", type="primary", width="stretch",
+                      on_click=lambda: S.update(oc_halted=True, oc_running=False))
+            steer_mode = st.segmented_control("When I send a message", list(LABELS), default="Steer",
+                                              key="oc_send_mode_live", format_func=LABELS.get) or "Steer"
+        else:
+            c1, c2 = st.columns([3, 1], vertical_alignment="center")
+            c1.markdown(f"⚪ **No negotiation running** for {S.oc_scenario.flight}. Choose **Steer** to send new "
+                        "information that updates the flight and starts a negotiation with it.")
+            c2.button("⏹ Stop", width="stretch", disabled=True, key="oc_stop_idle")
+            steer_mode = st.segmented_control("When I send a message", list(LABELS), default="Ask",
+                                              key="oc_send_mode_idle", format_func=LABELS.get) or "Ask"
+
+if S.pop("oc_override_now", False):
+    S.oc_halted = False
+    restart(scenario(), make_rule_agents(), "AUTONOMOUS", "",
+            "Override: the deterministic layer decides (no AI)")
+    st.rerun()
+
 placeholder = ("Message the team… (@ATC, @Pilot, @Ground to address someone)" if channel == "group"
                else f"Message {NAMES[channel]} privately…")
 prompt = st.chat_input(placeholder, disabled=len(os.environ.get("ANTHROPIC_API_KEY", "")) < 40)
+if demo_prompt:
+    prompt = demo_prompt
 if voice_text and not prompt:
     prompt = voice_text
     # spoken names work like @mentions in the group chat
@@ -760,6 +758,9 @@ if voice_text and not prompt:
 if prompt:
     post(channel, {"t": "msg", "who": "user", "text": prompt, "meta": "🎙️ spoken" if voice_text else None},
          log_line=f"DUTY OFFICER: {prompt}")
+    if channel == "group" and steer_mode in ("Steer", "Override") and S.oc_scenario is not None:
+        steer_negotiation(prompt, override=steer_mode == "Override")
+        st.rerun()
     if channel == "group":
         targets = list(dict.fromkeys(MENTIONS[m.lower()] for m in re.findall(r"@\w+", prompt)
                                      if m.lower() in MENTIONS)) or ["MODERATOR"]
@@ -767,4 +768,10 @@ if prompt:
             talk(agent, "group", prompt)
     else:
         talk(channel, channel, prompt)
+    st.rerun()
+
+# A negotiation interrupted by any click (switching channel, a sidebar widget...) resumes where it stopped.
+if (S.oc_session is not None and S.get("oc_running") and not S.get("oc_halted") and S.oc_outcome is None
+        and S.oc_pending is None and S.oc_ratify is None):
+    pump()
     st.rerun()

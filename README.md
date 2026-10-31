@@ -85,7 +85,7 @@ summarised reasoning, `thinking.display: "summarized"`), pending decisions, alar
 against this exact contract.
 
 ## Guided demo and voice
-- **Ops settings → 🎬 Start guided demo** walks through every feature on one real DOT row: **UA1112, Dulles → Denver,
+- **Ops settings → 🎬 Demo** sends one prompt to #ops-team that makes the Chief of Staff run the whole flow on one real DOT row: **UA1112, Dulles → Denver,
   6 May 2015** (row 115187; WEATHER_DELAY 37, LATE_AIRCRAFT_DELAY 26; real KDEN thunderstorm with lightning, MOD
   turbulence PIREP, runways closed, stand conflict, tight fuel). The steps are: meet the team · brief the Chief with the
   DOT row · cross-domain handoff · bounded negotiation with stakeholder votes · rogue agents blocked · AI outage
@@ -93,6 +93,13 @@ against this exact contract.
   deterministic (free).
 - **Voice:** in CHATS click 🎙️ Enable voice, allow the microphone, and speak. Speech is transcribed locally with Whisper
   (faster-whisper, offline). Starting with an agent's name ("ATC…", "Captain…") works like an @mention.
+
+## Failure analysis (🔍 FAILURE ANALYSIS page, `failures.py`)
+Every negotiation that ended in the deterministic planner or a human override, read from the consensus logs:
+the fallback rate, the primary cause (which hard limit kept blocking plans), the deadlock point (the last plan and
+exactly what it broke), which domains collided, and the cost of failure (USD and CO2 at 3.16 kg per kg of fuel)
+against the best safe plan the AI produced. A **what-if replay** reruns the same scenario with levers an operator
+controls (extra fuel uplift, ramp staffing, a free stand). Regulatory minimums are never relaxed in a replay.
 
 ## Data
 - `data/flights.csv` is the US DOT 2015 extract. Each scenario starts from one of its rows.

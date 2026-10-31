@@ -212,14 +212,17 @@ def play_alert(force: bool = False) -> bool:
     return True
 
 
+VERB = {"PROPOSE": "proposes", "ACCEPT": "agrees", "COUNTER": "suggests instead"}
+
+
 def plan_text(s: Scenario, p) -> str:
-    return f"TLDT **{s.clock(p.landing_slot_min)}** (slot {p.landing_slot_min}) · RWY **{p.runway}** · stand **{p.gate}**"
+    return f"land **{s.clock(p.landing_slot_min)}** · runway **{p.runway}** · stand **{p.gate}**"
 
 
 def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool = True, autonomy: str = "") -> None:
     """Render one negotiation event. Chat-style events open their own chat bubble."""
     if kind == "turn":
-        st.markdown(f"##### — Round {data['round']} · turn {data['round_turn']} / {MAX_TURNS} —")
+        st.markdown(f"##### Round {data['round']} · turn {data['round_turn']} of {MAX_TURNS}")
     elif kind in ("ratification", "ratification_request"):
         with st.chat_message("MODERATOR", avatar=AVATARS["MODERATOR"]):
             st.markdown(f"**{NAMES['MODERATOR']}** · Plan #{data.plan_id} is agreed and needs all three stakeholders "
@@ -233,9 +236,11 @@ def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool =
             for risk in data.risks:
                 st.markdown(f"- ⚠️ {risk}")
             for p in data.positions:
-                st.markdown(f"**{NAMES[p.agent]}** ({p.stance.lower()}): {p.rationale} *Concession:* {p.concession}")
-                if p.constraints:
-                    st.caption("Published: " + "; ".join(p.constraints))
+                st.markdown(f"**{NAMES[p.agent]}** {VERB.get(p.stance, p.stance.lower())}: {p.rationale}")
+            if any(p.constraints for p in data.positions):
+                with st.expander("🔧 Technical details"):
+                    for p in data.positions:
+                        st.caption(f"{NAMES[p.agent]}: " + "; ".join(p.constraints) + f" · gives: {p.concession}")
     elif kind == "vote":
         with st.chat_message(data.agent, avatar=AVATARS[data.agent]):
             who = "person" if data.by == "HUMAN" else "AI agent"
@@ -243,22 +248,24 @@ def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool =
                         + (":green-badge[AGREE]" if data.agree else ":red-badge[DISAGREE]") + f" {data.reason}")
     elif kind == "message":
         with st.chat_message(data.agent, avatar=AVATARS[data.agent]):
-            tag = f"plan #{data.plan_id}" if data.stance == "PROPOSE" else f"re #{data.answering_plan}"
-            st.markdown(f"**{NAMES[data.agent]}** :{STANCE[data.stance]}-badge[{data.stance}] `{tag}` "
-                        f"{plan_text(s, data.proposal)}")
+            tag = f"plan {data.plan_id}" if data.stance == "PROPOSE" else f"on plan {data.answering_plan}"
+            st.markdown(f"**{NAMES[data.agent]}** :{STANCE[data.stance]}-badge[{VERB[data.stance]}] "
+                        f"{plan_text(s, data.proposal)} :gray[({tag})]")
             if data.thinking:
                 with st.expander("💭 Thinking"):
                     st.caption(data.thinking)
             st.write(data.rationale)
+            st.caption(f"Willing to give: {data.concession}")
             if data.constraints:
-                with st.expander(f"{len(data.constraints)} published constraints"):
+                with st.expander(f"🔧 Technical details ({len(data.constraints)} limits published)"):
                     for c in data.constraints:
                         st.markdown(f"{'🔒' if c.hard else '◦'} **{c.name}**: {c.value}")
-            meta = f"Concession: {data.concession}"
+            meta = ""
             if data.metric:
                 meta += (f" · {data.metric.latency_s}s · {data.metric.input_tokens}+{data.metric.output_tokens} tok"
                          f" · ${data.metric.cost_usd:.4f}")
-            st.caption(meta)
+            if meta:
+                st.caption(meta.lstrip(" ·"))
     elif kind == "brief":
         with st.chat_message("MODERATOR", avatar=AVATARS["MODERATOR"]):
             st.markdown(f"**{NAMES['MODERATOR']}** · {data.summary}")
@@ -270,10 +277,11 @@ def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool =
             if data.bridge_proposal:
                 st.markdown("Bridge plan: " + plan_text(s, data.bridge_proposal))
             for d in data.directives:
-                st.caption(f"→ {AVATARS[d.agent]} {d.instruction}")
+                st.caption(f"→ **{NAMES[d.agent]}**: {d.instruction}")
     elif kind == "system":
         icon = {"consensus": "✅", "ratified": "✅", "fallback": "🛑", "stale_reply": "🕓", "human_rejected": "👤",
-                "stakeholder_objection": "↩️", "moderator_unavailable": "⚠️"}.get(data["kind"], "🚫")
+                "stakeholder_objection": "↩️", "moderator_unavailable": "⚠️", "operator_directive": "🧭",
+                "firewall_refused": "🛡️", "negotiation_stopped": "⏸️", "negotiation_restarted": "↻"}.get(data["kind"], "🚫")
         with st.chat_message("SYSTEM", avatar=AVATARS["SYSTEM"]):
             st.markdown(f"{icon} **{data['kind'].replace('_', ' ').upper()}**: {data['text']}")
     elif kind == "validation":

@@ -12,7 +12,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, create_model
 
-from agents.base import SAFETY_CHARTER, BaseAgent, ConstraintClaim, reply_schema  # noqa: F401
+from agents.base import PLAIN_VOICE, SAFETY_CHARTER, BaseAgent, ConstraintClaim, reply_schema  # noqa: F401
 from constraints import Proposal
 from monitoring import CallMetric
 from scenario import Scenario
@@ -60,7 +60,7 @@ class ModeratorAgent(BaseAgent):
             "decision-support table: it prices every plan seen so far in USD (fuel, delay, missed connections, "
             "overtime, knock-on) and marks which pass every hard check; never bridge to a plan marked UNSAFE, and "
             "among safe plans prefer the cheapest unless a specialist has published a reason the table cannot see. "
-            "Be terse: summary at most two sentences, one sentence per directive.")
+            "Be terse: summary at most two sentences, one sentence per directive.\n\n" + PLAIN_VOICE)
 
     def public_brief(self, s: Scenario) -> str:
         return (f"Flight {s.flight} ({s.airline}, tail {s.tail_number}, {s.aircraft_type}) {s.origin}-{s.destination} "

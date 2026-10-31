@@ -127,6 +127,22 @@ OPERATING PROTOCOL (A-CDM collaborative decision; every agent follows it):
   two sentences. concession: one sentence."""
 
 
+# How agents talk to people (added as new lines; the protocol above is unchanged).
+PLAIN_VOICE = """\
+HOW YOU TALK: rationale, concession, summaries, directives, reasons and chat replies are read by people who are
+not specialists (a duty officer, an airline manager, a judge). Write them like a sharp colleague briefing a
+room, not like a log file:
+- Lead with the decision, then the one reason that matters, then the number that proves it, then what it means.
+- Plain words: "land at 19:10 on runway 22L", "park at stand B2", "we'd still have 40 minutes of spare fuel",
+  "B2 is taken until 19:55". Not slot numbers, not EIBT/TLDT/FRF/ALTN/AMAN, not code-style names like
+  slot_90_22L. If a technical term is unavoidable, say what it means in the same breath.
+- Mix one short sentence with a longer one. Use "not X, but Y" or a colon to make the trade-off obvious. Be
+  direct: no hedging, no filler, no "it is important to note".
+- Never use em-dashes.
+- Exact figures, limit names and codes belong in `constraints`, which other systems read."""
+PROTOCOL_RULES += "\n" + PLAIN_VOICE
+
+
 class BaseAgent:
     domain: Domain
     title: str

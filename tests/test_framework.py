@@ -562,6 +562,24 @@ class TestStressSuite(unittest.TestCase):
         self.assertIn("TIME_BUDGET", [a.code for a in out.alarms])
 
 
+class TestFailureAnalysis(unittest.TestCase):
+    def test_fallback_runs_are_explained(self):
+        import tempfile
+        from pathlib import Path
+        import failures as F
+        from baseline_agents import make_drill_agents
+        s = scenario()
+        with tempfile.TemporaryDirectory() as d, mock.patch("negotiation.LOG_DIR", Path(d)), \
+                mock.patch.object(F, "LOG_DIR", Path(d)), mock.patch("negotiation.dispatch", side_effect=lambda a: a):
+            negotiate(s, make_drill_agents())
+            runs = F.load_runs()
+        self.assertEqual(len(runs), 1)
+        self.assertTrue(runs[0].failed)
+        a = F.autopsy(runs[0])
+        self.assertIn(a.primary_cause, ("Fuel reserve", "Unsafe ACCEPT overridden", "Deadlock (no movement)"))
+        self.assertTrue(a.deadlock_point)
+
+
 class TestEscalationAndLog(unittest.TestCase):
     def test_webhook_called(self):
         with mock.patch.dict("os.environ", {"ESCALATION_WEBHOOK_URL": "https://example.invalid/hook"}), \

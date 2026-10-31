@@ -95,7 +95,10 @@ s = get_scenario(pick, weather_mode)
 scen_key = (pick, weather_mode)
 if st.session_state.get("cr_scen_key") != scen_key:
     st.session_state.update(cr_scen_key=scen_key, sess=None, events=[], pending=None, ratify=None, outcome=None,
-                            choice=None, played=set(), cr_emergency=None)
+                            choice=None, played=set(), cr_emergency=None, cr_steered=None, cr_halted=False,
+                            cr_running=False)
+if st.session_state.get("cr_steered") is not None:
+    s = st.session_state.cr_steered  # the flight as updated by the duty officer's steering
 
 # ============================================================================
 # Header
@@ -132,10 +135,11 @@ with tab_neg:
                        width="stretch")
 
     b1, b2, _ = st.columns([1.2, 0.8, 4])
-    start = b1.button("▶ Start negotiation", type="primary", disabled=use_claude and not key_ok)
+    b1.button("▶ Start negotiation", type="primary", disabled=use_claude and not key_ok,
+              on_click=lambda: st.session_state.update(cr_start=True))
     if b2.button("↺ Reset"):
         st.session_state.update(sess=None, events=[], pending=None, ratify=None, outcome=None, choice=None, played=set(),
-                                cr_emergency=None)
+                                cr_emergency=None, cr_steered=None, cr_halted=False, cr_running=False)
         st.rerun()
     req_m = st.session_state.pop("mayday_request", None)  # from the sidebar's confirmed MAYDAY
     if req_m:
@@ -144,29 +148,80 @@ with tab_neg:
                        detail=f"Divert {plan.divert_to}" if plan.divert_to else
                        f"RWY {plan.proposal.runway} {plan.landing_clock}, stand {plan.proposal.gate}",
                        flight=s.flight, turn=0))
-        st.session_state.update(sess=None, pending=None, ratify=None, cr_emergency=plan, cr_em_live=True)
+        st.session_state.update(sess=None, pending=None, ratify=None, cr_emergency=plan, cr_em_live=True,
+                                cr_running=False, cr_halted=False)
         st.rerun()
     if st.session_state.get("cr_emergency") is not None:
         render_emergency(s, st.session_state.cr_emergency, live=st.session_state.pop("cr_em_live", False),
                          sound=sound)
 
+    def build_agents():
+        if use_claude:
+            overrides = {r: m_ for r, m_ in per_role.items() if m_ != "(same)"}
+            return make_agents(model=model, effort=effort, moderator=use_moderator, models=overrides,
+                               timeout_s=float(timeout_s))
+        return make_engine_agents(kind, "", "")
+
+    # 1. A fresh start creates the session first, so the live panel below is already on screen while agents talk.
+    if st.session_state.pop("cr_start", False):
+        st.session_state.update(sess=NegotiationSession(s, build_agents(), Autonomy(autonomy)), events=[], pending=None,
+                                ratify=None, outcome=None, choice=None, cr_halted=False, cr_running=True)
+
+    # 2. Live control panel: ABOVE the conversation, on screen at all times.
+    live = st.session_state.get("sess") is not None and st.session_state.outcome is None
+    if True:
+        with st.container(border=True):
+            if st.session_state.get("cr_halted"):
+                st.markdown("⏸️ **Negotiation stopped.** Tell the team what changed and send it as **Steer**, or:")
+                h1, h2, _ = st.columns([1, 1.7, 3])
+                h1.button("▶ Resume", key="cr_resume",
+                          on_click=lambda: st.session_state.update(cr_halted=False, cr_running=True))
+                h2.button("⛔ Deterministic layer decides", key="cr_override_now",
+                          on_click=lambda: st.session_state.update(cr_override_go=True))
+            elif live:
+                c1, c2 = st.columns([3, 1], vertical_alignment="center")
+                c1.markdown("🟢 **Live negotiation.** Something changed? Stop it, or type it below and the team "
+                            "will re-plan.")
+                c2.button("⏹ Stop", key="cr_stop", type="primary", width="stretch",
+                          on_click=lambda: st.session_state.update(cr_halted=True, cr_running=False))
+            else:
+                c1, c2 = st.columns([3, 1], vertical_alignment="center")
+                c1.markdown("⚪ **No negotiation running.** Something changed? Type it below: the flight is updated "
+                            "and a negotiation starts with the new information.")
+                c2.button("⏹ Stop", key="cr_stop_idle", width="stretch", disabled=True)
+            with st.form("cr_steer_form", clear_on_submit=True, border=False):
+                text = st.text_input("What changed?", placeholder="e.g. Runway 22L closed for 40 minutes, disabled "
+                                     "aircraft · stand B2 lost to a tow · fuel leak, 10 minutes less fuel")
+                mode = st.segmented_control("Send as", ["Steer", "Override"], default="Steer",
+                                            format_func={"Steer": "🧭 Steer: Chief synthesizes & restarts",
+                                                         "Override": "⛔ Override: deterministic layer decides"}.get)
+                if st.form_submit_button("Send to the team", type="primary") and text.strip():
+                    if len(os.environ.get("ANTHROPIC_API_KEY", "")) < 40:
+                        st.error("Steering needs the Chief of Staff (Claude): add your API key to .env.")
+                    else:
+                        st.session_state.cr_steer_req = (text.strip(), mode or "Steer")
+                        st.session_state.update(cr_halted=True, cr_running=False)  # freeze the negotiation now
+
+    # 3. The conversation so far.
     for k, d in st.session_state.events:
         render(k, d)
-
     status = st.empty()
 
     def pump(choice=None):
         sess: NegotiationSession = st.session_state.sess
+        st.session_state.update(cr_running=True, cr_halted=False)
         ev = sess.advance(choice)
         while True:
             k, d = ev
             if k == "thinking":
-                status.info(" · ".join(f"{AVATARS[a]} {NAMES[a]}" for a in d["agents"]) + " working…")
+                status.info(" · ".join(NAMES[a] for a in d["agents"]) + " working…")
             elif k == "metric":
                 pass
             else:
                 st.session_state.events.append(ev)
                 render(k, d, live=True)
+            if k in ("ratification", "decision", "outcome"):
+                st.session_state.cr_running = False
             if k == "ratification":
                 status.empty()
                 st.session_state.ratify = d
@@ -181,22 +236,76 @@ with tab_neg:
                 return
             ev = sess.advance()
 
-    if start:
-        if use_claude:
-            overrides = {r: m_ for r, m_ in per_role.items() if m_ != "(same)"}
-            agents = make_agents(model=model, effort=effort, moderator=use_moderator, models=overrides,
-                                 timeout_s=float(timeout_s))
-        else:
-            agents = make_engine_agents(kind, "", "")
-        st.session_state.update(sess=NegotiationSession(s, agents, Autonomy(autonomy)), events=[], pending=None,
-                                ratify=None, outcome=None)
+    def note(kind_: str, text_: str) -> None:
+        ev = ("system", {"turn": 0, "kind": kind_, "text": text_})
+        st.session_state.events.append(ev)
+        render(*ev, live=True)
+
+    def restart(new_s, agents, autonomy_: str, directive: str, label: str) -> None:
+        sess = NegotiationSession(new_s, agents, Autonomy(autonomy_))
+        if directive:  # on every agent's bus, every turn (the constraint ledger is always shown)
+            sess.ledger[("CHIEF", "operator_directive")] = f"CHIEF OF STAFF DIRECTIVE (from the duty officer): {directive}"
+            sess.log.add(0, "HUMAN", "operator_directive", {"directive": directive})
+        st.session_state.update(sess=sess, pending=None, ratify=None, outcome=None, cr_halted=False)
+        note("negotiation_restarted", label)
         pump()
+
+    def steer_live(text_: str, override: bool) -> None:
+        """Chief synthesizes -> code firewall -> new facts applied to the flight -> restart from turn 1."""
+        import steer
+        st.session_state.update(cr_running=False, cr_halted=True)
+        note("negotiation_stopped", f"Duty officer: “{text_}”")
+        chief = make_agents(model=model if use_claude else DEFAULT_MODEL,
+                            effort=effort if use_claude else "medium")["MODERATOR"]
+        record = "\n".join(f"{k}: {getattr(d, 'rationale', '') or (d.get('text', '') if isinstance(d, dict) else '')}"
+                           for k, d in st.session_state.events[-20:])
+        with st.spinner("Chief of Staff is synthesizing the new information…"):
+            directive = steer.synthesize(chief, s, text_, record)
+        if directive.emergency != "NONE":
+            st.session_state.mayday_request = {"kind": directive.emergency, "reason": directive.summary}
+            return
+        accepted, refused, ignored = steer.firewall(s, directive)
+        if refused:
+            with st.spinner("The safety firewall refused part of it: the Chief is explaining…"):
+                r = steer.explain_refusal(chief, text_, refused)
+            note("firewall_refused", f"**{r.header}.** {r.explanation} Safe alternative you can send: "
+                                     f"_{r.safe_alternative}_ The negotiation stays stopped.")
+            return
+        new_s = steer.apply(s, accepted, directive.summary)
+        st.session_state.cr_steered = new_s
+        applied = [steer.describe(new_s, e) for e in accepted]
+        text_d = directive.summary + (" Applied: " + "; ".join(applied) + "." if applied else "") + "".join(
+            f" {g.agent}: {g.instruction}" for g in directive.guidance)
+        note("operator_directive", f"{directive.summary}"
+             + (f" **Now enforced by the safety checks:** {'; '.join(applied)}." if applied else "")
+             + (f" _Ignored: {'; '.join(ignored)}_" if ignored else ""))
+        if override:
+            restart(new_s, make_engine_agents("Deterministic", "", ""), "AUTONOMOUS", text_d,
+                    "Override: the deterministic layer decides on the updated flight (no AI).")
+        else:
+            restart(new_s, build_agents(), autonomy, text_d, "Negotiation restarted from turn 1 with the new information.")
+
+    # 4. Requests, processed after the conversation so new messages appear in order.
+    steer_req = st.session_state.pop("cr_steer_req", None)
+    if steer_req:
+        steer_live(steer_req[0], override=steer_req[1] == "Override")
         st.rerun()
-    elif st.session_state.choice is not None and st.session_state.sess is not None:
+    if st.session_state.pop("cr_override_go", False):
+        restart(s, make_engine_agents("Deterministic", "", ""), "AUTONOMOUS", "",
+                "Override: the deterministic layer decides (no AI).")
+        st.rerun()
+    if st.session_state.get("choice") is not None and st.session_state.get("sess") is not None:
         choice, st.session_state.choice = st.session_state.choice, None
         pump(choice)
         st.rerun()
+    # A fresh start, or a negotiation interrupted by any click, runs (on) from here.
+    if (st.session_state.get("sess") is not None and st.session_state.get("cr_running")
+            and not st.session_state.get("cr_halted") and st.session_state.outcome is None
+            and st.session_state.get("pending") is None and st.session_state.get("ratify") is None):
+        pump()
+        st.rerun()
 
+    # 5. Cards that need the duty officer, and the outcome.
     if st.session_state.get("ratify") is not None:
         votes = ratification_form(st.session_state.ratify, "cr_ratify")
         if votes is not None:

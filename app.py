@@ -63,7 +63,8 @@ def weather_watch() -> None:
 page = st.navigation([
     st.Page("views/ops_chat.py", title="CHATS", icon="💬", default=True),
     st.Page("views/control_room.py", title="CONTROLS", icon="🛫"),
-    st.Page("views/ops_settings_page.py", title="Ops settings", icon="⚙️"),
+    st.Page("views/failure_analysis.py", title="FAILURE ANALYSIS", icon="🔍"),
+    st.Page("views/ops_settings_page.py", title="OPS SETTINGS", icon="⚙️"),
 ])
 page.run()
 
