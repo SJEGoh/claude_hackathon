@@ -93,11 +93,11 @@ def ground_note(base_turnaround: int) -> str:
 def get() -> OpsSettings:
     mtime = SETTINGS_FILE.stat().st_mtime if SETTINGS_FILE.exists() else 0
     if _CACHE.get("mtime") != mtime:
-        data = json.loads(SETTINGS_FILE.read_text()) if mtime else {}
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8")) if mtime else {}
         _CACHE.update(mtime=mtime, s=OpsSettings(**data))
     return _CACHE["s"]
 
 
 def save(s: OpsSettings) -> None:
     SETTINGS_FILE.parent.mkdir(exist_ok=True)
-    SETTINGS_FILE.write_text(s.model_dump_json(indent=1))
+    SETTINGS_FILE.write_text(s.model_dump_json(indent=1), encoding="utf-8")

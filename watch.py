@@ -226,7 +226,7 @@ def run_checks(iata: str) -> list[Alert]:
 def poll(airports: Optional[list[str]] = None) -> list[WatchEvent]:
     """Run every check, compare with the last known state, notify on NEW / ESCALATED / CLEARED."""
     cfg = ops_settings.get()
-    state: dict = json.loads(STATE.read_text()) if STATE.exists() else {}
+    state: dict = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
     current: dict[str, Alert] = {}
     for iata in airports or cfg.watch_airports:
         try:
@@ -254,22 +254,22 @@ def poll(airports: Optional[list[str]] = None) -> list[WatchEvent]:
             ev.channels = push(f"{prefix} {ev.alert.airport}: {ev.alert.title}", ev.alert.detail, ev.alert.severity
                                if ev.kind != "CLEARED" else "INFO")
     W.CACHE.mkdir(exist_ok=True)
-    STATE.write_text(json.dumps({k: a.model_dump() for k, a in current.items()}, indent=1))
-    with EVENTS.open("a") as f:
+    STATE.write_text(json.dumps({k: a.model_dump() for k, a in current.items()}, indent=1), encoding="utf-8")
+    with EVENTS.open("a", encoding="utf-8") as f:
         for ev in events:
             f.write(ev.model_dump_json() + "\n")
     return events
 
 
 def active_alerts() -> list[Alert]:
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    state = json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
     return sorted((Alert(**a) for a in state.values()), key=lambda a: (-SEV_RANK[a.severity], a.airport))
 
 
 def recent_events(n: int = 50) -> list[WatchEvent]:
     if not EVENTS.exists():
         return []
-    return [WatchEvent(**json.loads(line)) for line in EVENTS.read_text().splitlines()[-n:]][::-1]
+    return [WatchEvent(**json.loads(line)) for line in EVENTS.read_text(encoding="utf-8").splitlines()[-n:]][::-1]
 
 
 def main() -> None:

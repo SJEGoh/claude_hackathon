@@ -44,13 +44,13 @@ _CACHE: dict = {}
 def weights() -> Weights:
     mtime = WEIGHTS_FILE.stat().st_mtime if WEIGHTS_FILE.exists() else 0
     if _CACHE.get("mtime") != mtime:
-        _CACHE.update(mtime=mtime, w=Weights(**json.loads(WEIGHTS_FILE.read_text())) if mtime else Weights())
+        _CACHE.update(mtime=mtime, w=Weights(**json.loads(WEIGHTS_FILE.read_text(encoding="utf-8"))) if mtime else Weights())
     return _CACHE["w"]
 
 
 def save_weights(w: Weights) -> None:
     WEIGHTS_FILE.parent.mkdir(exist_ok=True)
-    WEIGHTS_FILE.write_text(w.model_dump_json(indent=1))
+    WEIGHTS_FILE.write_text(w.model_dump_json(indent=1), encoding="utf-8")
 
 
 def breakdown(pilot: dict, ground: dict, atc: dict, remote: bool, w: Weights | None = None) -> dict[str, float]:
