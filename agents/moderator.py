@@ -33,6 +33,7 @@ class ModeratorMessage(ModeratorReply):
     agent: Literal["MODERATOR"] = "MODERATOR"
     turn: int
     metric: Optional[CallMetric] = None
+    thinking: Optional[str] = None
 
 
 def _moderator_schema(s: Scenario) -> type[BaseModel]:
@@ -71,9 +72,9 @@ class ModeratorAgent(BaseAgent):
         content = (f"## Public disruption facts\n{self.public_brief(s)}\n\n## Public bus\n{bus or '(empty)'}"
                    + (f"\n\n## Decision support (deterministic)\n{support}" if support else "")
                    + f"\n\n## Task\n{task}")
-        reply, metric = self._call(content, _moderator_schema(s), turn, system=f"{self.role}\n\n{SAFETY_CHARTER}")
+        reply, metric, thinking = self._call(content, _moderator_schema(s), turn, system=f"{self.role}\n\n{SAFETY_CHARTER}")
         data = reply.model_dump()
-        return ModeratorMessage(**data, turn=turn, metric=metric)
+        return ModeratorMessage(**data, turn=turn, metric=metric, thinking=thinking)
 
 
 def render_brief(m: ModeratorMessage) -> str:

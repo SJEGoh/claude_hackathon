@@ -21,6 +21,7 @@ from scenario import Scenario
 DEFAULT_MODEL = "claude-opus-5-5"
 MODELS_WITH_SERVER_FALLBACK = {"claude-opus-5-5", "claude-sonnet-5-5"}
 DEFAULT_TIMEOUT_S = 90.0
+THINKING = {"type": "adaptive", "display": "summarized"}  # readable summary of the real reasoning; same cost
 
 
 # ============================================================================
@@ -48,6 +49,7 @@ class AgentMessage(AgentReply):
     turn: int
     plan_id: int = 0  # version assigned when this message puts a plan on the table
     metric: Optional[CallMetric] = None
+    thinking: Optional[str] = None  # Claude's summarised reasoning for this message (display only)
 
 
 @lru_cache(maxsize=64)
@@ -132,9 +134,8 @@ class BaseAgent:
         if own_report is not None:
             parts.append(f"## Your deterministic check of plan #{plan_id}\n{render_report(own_report)}")
         parts.append(f"## Task (turn {turn} of 3)\n{self.task(turn, on_table, plan_id)}")
-        reply, metric = self._call("\n\n".join(parts), reply_schema(s), turn)
-        data = reply.model_dump()
-        return AgentMessage(**data, agent=self.domain, turn=turn, metric=metric)
+        reply, metric, thinking = self._call("\n\n".join(parts), reply_schema(s), turn)
+        return AgentMessage(**reply.model_dump(), agent=self.domain, turn=turn, metric=metric, thinking=thinking)
 
     def task(self, turn: int, on_table: Optional[Proposal], plan_id: int) -> str:
         return (f"ACCEPT plan #{plan_id} if it meets all your hard limits (copy it unchanged into proposal). "
@@ -147,10 +148,10 @@ class BaseAgent:
             kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
 
     def _call(self, user_content: str, schema: type[BaseModel], turn: int,
-              system: Optional[str] = None) -> tuple[BaseModel, CallMetric]:
+              system: Optional[str] = None) -> tuple[BaseModel, CallMetric, Optional[str]]:
         kwargs = dict(model=self.model, max_tokens=16000, system=system or self.system_prompt(),
                       messages=[{"role": "user", "content": user_content}], output_format=schema,
-                      output_config={"effort": self.effort})
+                      output_config={"effort": self.effort}, thinking=THINKING)
         self._add_fallbacks(kwargs)
         started = time.monotonic()
 
@@ -183,7 +184,12 @@ class BaseAgent:
         if response.parsed_output is None:
             metric.ok, metric.error = False, f"no structured reply ({response.stop_reason})"
             raise AgentError(self.domain, metric.error, metric)
-        return response.parsed_output, metric
+        return response.parsed_output, metric, thinking_summary(response.content)
+
+
+def thinking_summary(content) -> Optional[str]:
+    text = "\n\n".join(b.thinking for b in content if getattr(b, "type", "") == "thinking" and getattr(b, "thinking", ""))
+    return text.strip() or None
 
 
 def render_message(m: AgentMessage, s: Optional[Scenario] = None) -> str:

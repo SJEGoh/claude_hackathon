@@ -10,6 +10,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import os  # noqa: E402
+os.environ["OPS_SETTINGS_FILE"] = "/nonexistent/ops_settings.json"  # tests run on default limits
 import pydantic  # noqa: E402
 
 import weather as W  # noqa: E402

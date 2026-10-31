@@ -46,7 +46,7 @@ with st.sidebar:
         with st.expander("Per-role model override"):
             per_role = {r: st.selectbox(r, ["(same)", DEFAULT_MODEL, "claude-sonnet-5-5", "claude-haiku-5-5"], key=f"m_{r}")
                         for r in ("ATC", "PILOT", "GROUND", "MODERATOR")}
-        effort = st.select_slider("Effort", ["low", "medium", "high"], value="low")
+        effort = st.select_slider("Effort", ["low", "medium", "high"], value="medium", help="medium shows the agents' thinking summaries; low is cheaper and often skips thinking")
         timeout_s = st.slider("Per-call timeout (s)", 15, 180, 90)
         use_moderator = st.toggle("Chief of Staff moderator", value=True)
 

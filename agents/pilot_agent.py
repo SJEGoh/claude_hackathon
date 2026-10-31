@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from agents.base import BaseAgent
 from constraints import Domain
-from scenario import MIN_CONNECT_TIME_MIN, MIN_FUEL_ADVISORY_MARGIN_MIN, SEVERE_HOLD_LIMIT_MIN, Scenario
+import ops_settings
+from scenario import Scenario
 
 
 class PilotAgent(BaseAgent):
@@ -16,7 +17,7 @@ class PilotAgent(BaseAgent):
             "connections when it costs nothing in safety.")
 
     def private_brief(self, s: Scenario) -> str:
-        wx = s.weather
+        wx, cfg = s.weather, ops_settings.get()
         pireps = "; ".join(f"{p.raw[:80]} ({p.distance_nm:.0f} NM)" for p in (wx.pireps if wx else [])[:5])
         latest = s.latest_safe_landing
         return "\n".join([
@@ -27,14 +28,14 @@ class PilotAgent(BaseAgent):
             f"{s.hold_burn_kg_per_min} kg/min.",
             f"FRF {s.final_reserve_kg} kg + ALTN ({s.alternate}) {s.alternate_fuel_kg} kg = minimum landing fuel "
             f"{s.min_landing_fuel_kg} kg -> latest safe TLDT {s.clock(latest)} (slot {latest}). MINIMUM FUEL "
-            f"advisory inside {MIN_FUEL_ADVISORY_MARGIN_MIN} min of that (slot {latest - MIN_FUEL_ADVISORY_MARGIN_MIN}).",
+            f"advisory inside {cfg.min_fuel_advisory_margin_min} min of that (slot {latest - cfg.min_fuel_advisory_margin_min}).",
             f"Destination: {s.weather_attribution}",
             f"PIREPs at holding altitudes (<= FL180, 100 NM, +/-3 h): "
             f"{pireps or 'none filed (absence is not proof of smooth air)'}."
-            + (f" Max {SEVERE_HOLD_LIMIT_MIN} min holding in reported SEV conditions."
+            + (f" Max {cfg.severe_hold_limit_min} min holding in reported SEV conditions."
                if wx and "SEV" in (wx.hold_turbulence, wx.hold_icing) else ""),
             "Runway crosswind components: " + ", ".join(f"{r.id} {r.crosswind_kt} kt" for r in s.runways),
-            f"Onward connections (MCT {MIN_CONNECT_TIME_MIN} min after in-block): "
+            f"Onward connections (MCT {cfg.min_connect_time_min} min after in-block): "
             + (", ".join(f"{c.flight} to {c.destination} {c.pax} pax departs {s.clock(c.departs_at)} "
                          f"(slot {c.departs_at})" for c in s.connections) or "none tracked"),
         ])

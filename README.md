@@ -49,6 +49,27 @@ plan · ≤ 3 turns · inside the time budget · log intact.
 | ROGUE_AGENTS | safety drill | unsafe ACCEPT overridden |
 | STORM_FRONT_WAVE | arrivals compressed into remaining capacity | parallel negotiations on a stale snapshot; lock-protected ledger re-validates, re-plans, fuel priority; no wake conflict, no double-booked stand |
 
+## Ops settings and automated weather watch (⚙️ Ops settings page, sidebar watch)
+- **Settings wired into the safety checks and agents** (`ops_settings.py`, saved to `assets/ops_settings.json`):
+  runway condition code RWYCC 6→0 (ICAO GRF, illustrative table: lower crosswind limit and extra spacing, 0 closes
+  the runway), approach mode (Auto/Visual/ILS CAT I/CAT II-III spacing), crosswind and tailwind limits, minimum-fuel
+  margin, maximum holding in severe weather, minimum connection time, ramp staffing (stretches turnarounds), remote
+  stands on/off, crew overtime cap, negotiation time budget and default autonomy.
+- **Weather watch** (`watch.py`): every N minutes across a watchlist (default SIN, ORD, ATL, DFW) it checks:
+  thunderstorms (METAR TS/CB, TAF, forecast storm codes, CAPE); heavy rain; crosswind/tailwind per runway against the
+  runway-condition-adjusted limits; gusts; IFR/LIFR (low-visibility procedures); wind shear; MOD/SEV turbulence and
+  icing PIREPs; freezing precipitation; convective SIGMETs; and failed or stale feeds.
+  It only notifies on change (NEW / ESCALATED / CLEARED) to avoid alarm fatigue. Alerts go to sidebar toasts and
+  sound, the watch board, Slack/Teams webhook, Mac notifications and **phone push via [ntfy](https://ntfy.sh)**.
+  The app runs it on a timer, or run it standalone with `python watch.py` (`--once` for a single pass).
+
+## Realtime API for a custom dashboard (`api.py`)
+`uvicorn api:app --reload --port 8000` serves REST for actions and one WebSocket (`/ws`) that pushes everything live:
+weather-watch alerts (change-only), each negotiation step with every agent's **thinking summary** (Claude's
+summarised reasoning, `thinking.display: "summarized"`), pending decisions, alarms and emergencies.
+`docs/REACT_DASHBOARD_PROMPT.md` is a ready-to-paste prompt that makes Claude build an Apple-style React dashboard
+against this exact contract.
+
 ## Data
 - `eda.py` produces `eda/EDA_REPORT.md` and `eda/calibration.json` (taxi-in, arrival rates, turnaround). Key findings: the file
   is pre-filtered, all rows already meet the rule, October is missing, 88% of rows are late-aircraft only, and inbound delay

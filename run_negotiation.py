@@ -27,7 +27,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--row", type=int, default=0, help="index into the filtered disrupted-flight list")
     ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument("--effort", default="low", choices=["low", "medium", "high"])
+    ap.add_argument("--effort", default="medium", choices=["low", "medium", "high"])
     ap.add_argument("--autonomy", default="AUTONOMOUS", choices=[a.value for a in Autonomy])
     ap.add_argument("--agents", default="claude", choices=["claude", "rules"])
     ap.add_argument("--weather", default="HISTORICAL", choices=["HISTORICAL", "LIVE", "OFF"])

@@ -67,6 +67,7 @@ h1, h2, h3 { letter-spacing: -0.02em; font-weight: 800 !important; }
 [data-testid="stExpander"] details, [data-testid="stVerticalBlockBorderWrapper"] { border-radius: 16px !important; border-color: #22272F !important; }
 .stButton button { border-radius: 999px; font-weight: 600; }
 [data-testid="stSidebar"] .stButton button[kind="primary"] { background: #E5322D; border-color: #E5322D; color: #fff; }
+[data-testid="stAudio"] { display: none; }
 video { image-rendering: pixelated; border-radius: 14px; border: 1px solid #22272F; }
 .runway { height: 6px; margin: 2px 0 14px 0; border-radius: 3px;
   background: repeating-linear-gradient(90deg, #C6F432 0 26px, transparent 26px 46px); opacity: .85; }
@@ -81,6 +82,17 @@ video { image-rendering: pixelated; border-radius: 14px; border: 1px solid #2227
 @keyframes blink { to { visibility: hidden; } }
 </style>
 """
+
+
+def fire_test_alert() -> list[str]:
+    """Run the whole notification chain on demand: toast + sound here, and every external channel."""
+    from escalation import push
+    sent = push("🧪 TEST ALARM · WSSS: Thunderstorm at the field",
+                "Test alert from A-CDM Ops. If you can see/hear this, notifications work.", "ALARM")
+    st.toast("🧪 TEST ALARM · Thunderstorm at the field", icon="🚨")
+    if not play_alert():
+        st.toast("Sound is off: turn on 🔔 Alert sounds in the sidebar", icon="🔕")
+    return sent
 
 
 def apply_theme() -> None:
@@ -161,14 +173,39 @@ def get_scenario(idx: int, weather_mode: str) -> Scenario:
     return build_scenario(load_disrupted_flights(limit=None).loc[idx], weather_mode=weather_mode)
 
 
-def beep() -> bytes:
-    buf = io.BytesIO()
+@st.cache_data
+def chime(repeats: int = 2) -> bytes:
+    """Soft two-tone alert chime (880 Hz then 660 Hz, smooth attack/release), generated so no audio file is needed."""
+    rate, buf = 22050, io.BytesIO()
+    frames = bytearray()
+    for _ in range(repeats):
+        for freq in (880, 660):
+            n = int(rate * 0.16)
+            for i in range(n):
+                env = min(1.0, i / (rate * 0.01), (n - i) / (rate * 0.04))  # 10 ms attack, 40 ms release
+                frames += struct.pack("<h", int(9000 * env * math.sin(2 * math.pi * freq * i / rate)))
+            frames += b"\x00\x00" * int(rate * 0.06)
+        frames += b"\x00\x00" * int(rate * 0.25)
     with wave.open(buf, "wb") as w:
-        w.setnchannels(1), w.setsampwidth(2), w.setframerate(22050)
-        for i in range(int(22050 * 0.9)):
-            on = (i // 3300) % 2 == 0
-            w.writeframes(struct.pack("<h", int(12000 * math.sin(2 * math.pi * 880 * i / 22050)) if on else 0))
+        w.setnchannels(1), w.setsampwidth(2), w.setframerate(rate)
+        w.writeframes(bytes(frames))
     return buf.getvalue()
+
+
+beep = chime  # backwards-compatible name
+
+
+def sounds_on() -> bool:
+    return bool(st.session_state.get("sound_enabled"))
+
+
+def play_alert(force: bool = False) -> bool:
+    """Play the chime if the user has turned on 🔔 Alert sounds (that click unlocks browser audio).
+    The player is hidden by CSS. Returns whether a sound was played."""
+    if not (force or sounds_on()):
+        return False
+    st.audio(chime(), format="audio/wav", autoplay=True)
+    return True
 
 
 def plan_text(s: Scenario, p) -> str:
@@ -184,6 +221,9 @@ def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool =
             tag = f"plan #{data.plan_id}" if data.stance == "PROPOSE" else f"re #{data.answering_plan}"
             st.markdown(f"**{NAMES[data.agent]}** :{STANCE[data.stance]}-badge[{data.stance}] `{tag}` "
                         f"{plan_text(s, data.proposal)}")
+            if data.thinking:
+                with st.expander("💭 Thinking"):
+                    st.caption(data.thinking)
             st.write(data.rationale)
             if data.constraints:
                 with st.expander(f"{len(data.constraints)} published constraints"):
@@ -197,6 +237,9 @@ def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool =
     elif kind == "brief":
         with st.chat_message("MODERATOR", avatar=AVATARS["MODERATOR"]):
             st.markdown(f"**{NAMES['MODERATOR']}** · {data.summary}")
+            if data.thinking:
+                with st.expander("💭 Thinking"):
+                    st.caption(data.thinking)
             for c in data.open_conflicts:
                 st.markdown(f"- ⚠️ {c}")
             if data.bridge_proposal:
@@ -218,7 +261,7 @@ def render_event(s: Scenario, kind: str, data, live: bool = False, sound: bool =
         if live:
             st.toast(f"🚨 {data.title}", icon="🚨")
             if sound and data.severity == "ALARM":
-                st.audio(beep(), format="audio/wav", autoplay=True)
+                play_alert()
         if data.severity == "ALARM" and duty_phone():
             st.link_button(f"📞 Call duty manager {duty_phone()}", f"tel:{duty_phone()}")
     elif kind == "decision_auto":
@@ -299,7 +342,7 @@ def render_emergency(s: Scenario, plan: EmergencyPlan, readbacks: dict | None = 
     if live:
         st.toast(f"🚨 {KIND_LABEL[plan.kind]} {plan.flight}", icon="🚨")
         if sound:
-            st.audio(beep(), format="audio/wav", autoplay=True)
+            play_alert()
     cols = st.columns(3)
     for col, key in zip(cols, ("ATC", "PILOT", "GROUND")):
         with col.container(border=True):

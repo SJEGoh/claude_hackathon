@@ -5,8 +5,8 @@ from typing import Optional
 
 from agents.base import BaseAgent
 from constraints import Domain, Proposal, check_atc
-from scenario import IMC_EXTRA_SPACING_MIN, WAKE_SEPARATION_MIN, Scenario
-from weather import MAX_CROSSWIND_KT, MAX_TAILWIND_KT
+import ops_settings
+from scenario import WAKE_SEPARATION_MIN, Scenario
 
 
 class ATCAgent(BaseAgent):
@@ -19,15 +19,17 @@ class ATCAgent(BaseAgent):
             "published constraints into it.")
 
     def private_brief(self, s: Scenario) -> str:
+        cfg = ops_settings.get()
         seps = ", ".join(f"{a[0]}->{b[0]} {v}" for (a, b), v in WAKE_SEPARATION_MIN.items())
         wx = s.weather
         lines = [
             f"Inbound {s.flight} ({s.aircraft_type}, wake {s.wake}) {s.origin}-{s.destination}. "
             f"ELDT {s.clock(s.eta_min)} (slot {s.eta_min}). SIBT {s.clock(0)}.",
             f"METAR: {wx.metar if wx and wx.metar else 'not available'}",
-            f"Conditions: {'IMC' if s.imc else 'VMC'}{f' (+{IMC_EXTRA_SPACING_MIN} min spacing)' if s.imc else ''}. "
-            f"Wake minima min (leader->follower): {seps}. Limits: crosswind {MAX_CROSSWIND_KT} kt, tailwind "
-            f"{MAX_TAILWIND_KT} kt.",
+            f"Conditions: {'IMC' if s.imc else 'VMC'}; approach mode {cfg.approach}; runway condition RWYCC {cfg.rwycc}"
+            f" (+{cfg.extra_spacing(s.imc)} min spacing on every pair). Wake minima min (leader->follower): {seps}. "
+            f"Limits: crosswind {cfg.crosswind_limit():.0f} kt, tailwind {cfg.max_tailwind_kt:.0f} kt"
+            + (". RWYCC 0: ALL RUNWAYS CLOSED (nil braking)." if cfg.runway_closed_by_condition() else "."),
             s.taxiway_note,
             f"Scheduled stand on the flight plan: {s.scheduled_gate} (AOCC owns stand allocation).",
         ]

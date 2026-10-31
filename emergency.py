@@ -18,7 +18,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel
 
-from constraints import Proposal
+from constraints import Proposal, runway_usable
 from scenario import WAKE_SEPARATION_MIN, Scenario
 
 EmergencyKind = Literal["FUEL", "MEDICAL", "TECHNICAL"]
@@ -42,7 +42,7 @@ class EmergencyPlan(BaseModel):
 
 def plan_emergency(s: Scenario, kind: EmergencyKind, reason: str = "") -> EmergencyPlan:
     t0 = time.perf_counter()
-    usable = [r for r in s.runways if r.wind_within_limits]
+    usable = [r for r in s.runways if runway_usable(r)]
     if kind == "TECHNICAL":
         usable.sort(key=lambda r: (-r.length_ft, max(r.closed_until, s.eta_min)))
     else:

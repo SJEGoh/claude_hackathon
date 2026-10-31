@@ -12,7 +12,7 @@ from typing import Callable, Optional
 
 import anthropic
 
-from agents.base import MODELS_WITH_SERVER_FALLBACK
+from agents.base import MODELS_WITH_SERVER_FALLBACK, THINKING, thinking_summary
 from constraints import VALIDATORS, Proposal
 from monitoring import CallMetric, price
 from scenario import Scenario
@@ -103,14 +103,16 @@ class Conversation:
 
 def converse(client: anthropic.Anthropic, model: str, effort: str, system: str, conv: Conversation, content: str,
              tools: list[dict], impl: dict[str, Callable], on_tool: Optional[Callable[[str, dict, str], None]] = None,
-             timeout_s: float = 120.0) -> tuple[str, list[CallMetric]]:
-    """Send one user turn; run the tool loop (bounded); return the final text and per-call metrics."""
+             timeout_s: float = 120.0) -> tuple[str, list[CallMetric], Optional[str]]:
+    """Send one user turn; run the tool loop (bounded); return the final text, per-call metrics and Claude's
+    summarised reasoning across the loop."""
+    thoughts: list[str] = []
     start_len = len(conv.history)
     conv.history.append({"role": "user", "content": content})
     metrics: list[CallMetric] = []
     for _ in range(MAX_TOOL_STEPS):
         kwargs = dict(model=model, max_tokens=16000, system=system, messages=conv.history,
-                      output_config={"effort": effort})
+                      output_config={"effort": effort}, thinking=THINKING)
         if tools:
             kwargs["tools"] = tools
         if model in MODELS_WITH_SERVER_FALLBACK:
@@ -122,19 +124,21 @@ def converse(client: anthropic.Anthropic, model: str, effort: str, system: str, 
             del conv.history[start_len:]  # roll back so the history stays valid for the next message
             metrics.append(CallMetric(agent=conv.agent_key, turn=0, model=model,
                                       latency_s=round(time.monotonic() - started, 2), ok=False, error=str(e)[:200]))
-            return f"⚠️ I couldn't reach the model ({type(e).__name__}). Please retry.", metrics
+            return f"⚠️ I couldn't reach the model ({type(e).__name__}). Please retry.", metrics, None
         u = resp.usage
         metrics.append(CallMetric(agent=conv.agent_key, turn=0, model=model,
                                   latency_s=round(time.monotonic() - started, 2), input_tokens=u.input_tokens,
                                   output_tokens=u.output_tokens,
                                   cost_usd=price(model, u.input_tokens, u.output_tokens)))
         conv.history.append({"role": "assistant", "content": resp.content})  # unchanged, thinking blocks included
+        if (t := thinking_summary(resp.content)):
+            thoughts.append(t)
         if resp.stop_reason == "refusal":
-            return "I can't help with that request.", metrics
+            return "I can't help with that request.", metrics, None
         uses = [b for b in resp.content if b.type == "tool_use"]
         if resp.stop_reason != "tool_use" or not uses:
             text = "\n\n".join(b.text for b in resp.content if b.type == "text").strip()
-            return text or "(no reply)", metrics
+            return text or "(no reply)", metrics, "\n\n".join(thoughts) or None
         results = []
         for b in uses:
             try:
@@ -146,4 +150,4 @@ def converse(client: anthropic.Anthropic, model: str, effort: str, system: str, 
                 on_tool(b.name, b.input or {}, out)
             results.append({"type": "tool_result", "tool_use_id": b.id, "content": str(out), "is_error": is_err})
         conv.history.append({"role": "user", "content": results})
-    return "I hit my tool-step limit for this message; ask me to continue.", metrics
+    return "I hit my tool-step limit for this message; ask me to continue.", metrics, "\n\n".join(thoughts) or None

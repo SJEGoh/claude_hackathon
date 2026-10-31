@@ -87,7 +87,7 @@ with st.sidebar:
         key_ok = len(os.environ.get("ANTHROPIC_API_KEY", "")) > 40
         st.caption("✅ API key loaded from .env" if key_ok else "⚠️ No API key: add it to .env")
         model = st.selectbox("Model", [DEFAULT_MODEL, "claude-sonnet-5-5", "claude-haiku-5-5"])
-        effort = st.select_slider("Effort", ["low", "medium", "high"], value="low")
+        effort = st.select_slider("Effort", ["low", "medium", "high"], value="medium", help="medium shows the agents' thinking summaries; low is cheaper and often skips thinking")
         engine = st.radio("Negotiation engine", ENGINES)
         default_autonomy = st.radio("Default autonomy", [a.value for a in Autonomy], index=1,
                                     format_func=lambda a: a.replace("_", " ").title())
@@ -120,6 +120,9 @@ def draw(item: dict) -> None:
         with st.chat_message("user" if who == "user" else who, avatar=AVATARS.get(who, "👤")):
             if who != "user":
                 st.markdown(f"**{NAMES.get(who, who)}**" + (f" · _to the team_" if item.get("via") else ""))
+            if item.get("thinking"):
+                with st.expander("💭 Thinking"):
+                    st.caption(item["thinking"])
             st.markdown(item["text"])
             if item.get("meta"):
                 st.caption(item["meta"])
@@ -274,11 +277,12 @@ def talk(agent: str, ch: str, text: str, asked_by: str = "the duty officer", all
 
     show_status(agent, "working")
     with st.spinner(f"{NAMES[agent]} is typing…"):
-        reply, metrics = converse(client, model, effort, system_for(agent, ch), c, content, tools, impl, on_tool)
+        reply, metrics, thinking = converse(client, model, effort, system_for(agent, ch), c, content, tools, impl, on_tool)
     show_status(agent, "waiting" if (S.oc_pending and agent == "MODERATOR") else "idle")
     S.oc_metrics.extend(metrics)
     cost = sum(m.cost_usd for m in metrics)
-    post(ch, {"t": "msg", "who": agent, "text": reply, "meta": f"{sum(m.latency_s for m in metrics):.1f}s · ${cost:.4f}"},
+    post(ch, {"t": "msg", "who": agent, "text": reply, "thinking": thinking,
+              "meta": f"{sum(m.latency_s for m in metrics):.1f}s · ${cost:.4f}"},
          log_line=f"{agent}: {reply}")
     return reply
 

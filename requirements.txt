@@ -6,3 +6,5 @@ pydantic>=2
 requests
 timezonefinder
 matplotlib
+fastapi
+uvicorn[standard]

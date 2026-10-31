@@ -23,7 +23,7 @@ __all__ = ["ATCAgent", "PilotAgent", "GroundAgent", "ModeratorAgent", "BaseAgent
 ROLES = {"ATC": ATCAgent, "PILOT": PilotAgent, "GROUND": GroundAgent, "MODERATOR": ModeratorAgent}
 
 
-def make_agents(api_key: Optional[str] = None, model: str = DEFAULT_MODEL, effort: str = "low",
+def make_agents(api_key: Optional[str] = None, model: str = DEFAULT_MODEL, effort: str = "medium",
                 moderator: bool = True, models: Optional[dict[str, str]] = None,
                 timeout_s: float = DEFAULT_TIMEOUT_S) -> dict[str, BaseAgent]:
     """models: optional per-role override, e.g. {"MODERATOR": "claude-haiku-5-5"}."""
