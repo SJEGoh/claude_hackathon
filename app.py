@@ -6,6 +6,7 @@ Sidebar on every page: MAYDAY (with confirmation) at the top; weather watch, ale
 at the bottom.
 """
 import time
+from pathlib import Path
 
 import streamlit as st
 
@@ -16,6 +17,25 @@ import watch  # noqa: E402
 from ui_common import apply_theme, customise_dialog, fire_test_alert, mayday_dialog, play_alert  # noqa: E402
 
 apply_theme()
+
+# --- intro: plays once per session before the app opens -----------------------------------------------
+INTRO = Path(__file__).parent / "assets" / "intro.mp4"
+if INTRO.exists() and not st.session_state.get("intro_seen"):
+    st.markdown("""<style>
+      [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"], header {display: none !important;}
+      .block-container {max-width: 1100px; padding-top: 2.5rem;}
+      [data-testid="stVideo"] {border-radius: 18px; overflow: hidden; box-shadow: 0 0 60px rgba(90,200,255,.35);
+                               animation: intro-in 1.2s ease-out;}
+      @keyframes intro-in {from {opacity: 0; transform: scale(.96);} to {opacity: 1; transform: none;}}
+    </style>""", unsafe_allow_html=True)
+    st.video(str(INTRO), autoplay=True, muted=True)
+    _, mid, _ = st.columns([2, 1, 2])
+    if mid.button("Enter the control center →", type="primary", width="stretch"):
+        st.session_state.intro_seen = True
+        st.rerun()
+    st.caption("<div style='text-align:center'>Sound is muted for autoplay: unmute on the video. "
+               "Shown once per session.</div>", unsafe_allow_html=True)
+    st.stop()
 
 # --- top of the sidebar, every page: MAYDAY -------------------------------------------------------------
 if st.sidebar.button("🚨 DECLARE MAYDAY", type="primary", width="stretch",
@@ -81,3 +101,6 @@ with st.sidebar:
                    "Plays a chime for ALARMs, emergencies and tests; warnings stay silent.")
     if st.button("🎨 Customise agents", width="stretch"):
         customise_dialog()
+    if INTRO.exists() and st.button("🎬 Replay intro", width="stretch"):
+        st.session_state.intro_seen = False
+        st.rerun()
